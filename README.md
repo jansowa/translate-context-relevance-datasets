@@ -1,88 +1,95 @@
 # Translate context relevance dataset
 
-A script for translating the HuggingFace dataset `zilliz/natural_questions-context-relevance-with-think` from EN→PL.
+Repo contains the original script `translate_context_relevance_dataset.py` (left unchanged) and a new Docker Compose setup for local EN→PL translation through an OpenAI-compatible vLLM server.
 
-It writes the output to JSONL and uses checkpoints so the process can be resumed.
-It also supports a list of **API keys** and a list of **models**: for each `api_key × model` combination,
-it sends requests until it receives a response associated with hitting the limit (most commonly HTTP **429**),
-then automatically switches to the next combination.
+## What is new
 
-> Note: The exact meaning of “limits” depends on the API provider. The script treats HTTP **429** (and closely related rate/quota errors) as “limit reached”.
+- Two services in `docker-compose.yml`:
+  - `vllm` – OpenAI-compatible inference server (single model from `.env`),
+  - `translator` – lightweight Python worker that reads data, translates, and saves JSONL/checkpoints.
+- Single-model configuration (`MODEL_NAME`) instead of lists of API keys/models.
+- Parallel requests configured from `.env` via `PARALLEL_REQUESTS`.
+- NVIDIA multi-GPU support through `.env` `GPU_COUNT` (mapped to vLLM tensor parallel size).
+- Dependencies managed with `uv`, `requirements.in`, `requirements.txt`.
 
----
+## Files added for the new flow
 
-## Requirements
+- `run_translation_vllm.py` – threaded translator client (OpenAI-compatible).
+- `docker-compose.yml` – `vllm` + `translator` services.
+- `Dockerfile.translator` – small Python image for the translator.
+- `requirements.in`, `requirements.txt` – dependency inputs/pins.
+- `.env.example` – tiny model profile (`Qwen2.5-0.5B-Instruct`, 2 workers).
+- `.env.gptoss` – large profile (`gpt-oss-120b`, 16 workers).
 
-- Python 3.10+ (recommended)
-- Internet access (to download the dataset from HuggingFace)
-- Libraries: `openai`, `datasets`, `tqdm`
+## Quick start (RTX 3060 Ti / 8GB VRAM)
 
----
-
-## Setup (venv)
-
-```bash
-python -m venv .venv
-# Linux / macOS:
-source .venv/bin/activate
-# Windows (PowerShell):
-# .venv\Scripts\Activate.ps1
-
-python -m pip install -U pip
-pip install openai==1.64.0 datasets==3.3.2 tqdm==4.67.1
-````
-
-Optionally freeze dependencies:
+1. Copy defaults:
 
 ```bash
-pip freeze > requirements.txt
+cp .env.example .env
 ```
 
----
-
-## Usage (translate dataset with checkpoints)
-
-Minimal example:
+2. Start vLLM:
 
 ```bash
-python translate_context_relevance_dataset.py \
-  --base-url "https://your-provider.example/v1" \
-  --api-keys "KEY_1,KEY_2" \
-  --models "modelA,modelB"
+docker compose up -d vllm
 ```
 
-What you get:
+3. Run translator:
 
-* `out_pl/translated.jsonl` – final output (one record per line),
-* `out_pl/checkpoints/*.json` – per-`id` checkpoints (allow resuming).
-
-Resume:
-
-* Run again with the same parameters; the script will skip `id`s already present in `translated.jsonl`
-  and continue unfinished work based on checkpoints.
-
----
-
-## Key CLI parameters
-
-* `--api-keys` – list of keys (separator: `,` or `;`)
-* `--models` – list of models (separator: `,` or `;`)
-* `--base-url` – API base URL (optional)
-* `--delay-seconds` – delay after each successful request
-* `--max-retries` – retries for errors other than 429
-* `--skip-rows` – skip the first N dataset examples (e.g., 5000 => start from example #5001)
-* `--max-rows` – number of examples to process after skipping (0 = all remaining)
-* `--max-prompt-attempts` – how many increasingly strict prompts to try when the model breaks span structure
-
----
-
-## Notes
-
-* The script detects “limit reached” mainly via HTTP 429 status / related exceptions.
-* For non-limit errors, it retries with exponential backoff.
-* When a given `api_key × model` hits a limit, the script switches to the next combination and continues from checkpoints.
-* Existing lines in `translated.jsonl` are **not modified or removed**; new translations are appended as new lines.
-
+```bash
+docker compose up translator
 ```
-::contentReference[oaicite:0]{index=0}
+
+Output will be written the same way as before:
+
+- `out_pl/translated.jsonl`
+- `out_pl/checkpoints/*.json`
+
+## Environment variables (`.env`)
+
+Required:
+
+- `MODEL_NAME` – one model name used by both services.
+- `PARALLEL_REQUESTS` – number of parallel translation requests from `translator`.
+- `GPU_COUNT` – number of NVIDIA GPUs used by vLLM (`--tensor-parallel-size`).
+
+Optional:
+
+- `OPENAI_API_KEY` – token passed to OpenAI-compatible client (`EMPTY` is fine for local vLLM in many setups).
+- `VLLM_PORT` – published host port for vLLM (default `8000`).
+- `GPU_MEMORY_UTILIZATION` – vLLM memory fraction.
+- `MAX_MODEL_LEN` – vLLM max sequence length.
+
+## Translator behavior
+
+`run_translation_vllm.py` preserves the original translation logic:
+
+- same prompt structure,
+- same span repair strategy,
+- same checkpointing pattern,
+- same JSONL row format.
+
+Parallelization is done with `ThreadPoolExecutor`, and writes are serialized in a dedicated writer thread for better throughput under load.
+
+## Dependency workflow with uv
+
+Update pins after editing `requirements.in`:
+
+```bash
+uv pip compile requirements.in -o requirements.txt
 ```
+
+Install locally:
+
+```bash
+uv pip install -r requirements.txt
+```
+
+## Original script
+
+The existing script is intentionally kept as-is:
+
+- `translate_context_relevance_dataset.py`
+
+It still supports API key/model list rotation (`api_key × model`) and can be used independently if needed.
