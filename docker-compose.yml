@@ -1,6 +1,6 @@
 services:
   vllm:
-    image: vllm/vllm-openai:latest
+    image: vllm/vllm-openai:v0.8.5.post1
     env_file:
       - .env
     command:
@@ -18,13 +18,19 @@ services:
       - ${MAX_MODEL_LEN:-4096}
     ports:
       - "${VLLM_PORT:-8000}:8000"
-    gpus: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/models')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 15s
       timeout: 10s
-      retries: 20
-      start_period: 60s
+      retries: 40
+      start_period: 180s
 
   translator:
     build:
