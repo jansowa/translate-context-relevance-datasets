@@ -1,0 +1,46 @@
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    env_file:
+      - .env
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --model
+      - ${MODEL_NAME}
+      - --tensor-parallel-size
+      - ${GPU_COUNT}
+      - --gpu-memory-utilization
+      - ${GPU_MEMORY_UTILIZATION:-0.9}
+      - --max-model-len
+      - ${MAX_MODEL_LEN:-4096}
+    ports:
+      - "${VLLM_PORT:-8000}:8000"
+    gpus: all
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/models')"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+
+  translator:
+    build:
+      context: .
+      dockerfile: Dockerfile.translator
+    env_file:
+      - .env
+    environment:
+      VLLM_BASE_URL: http://vllm:8000/v1
+    depends_on:
+      vllm:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+    working_dir: /app
+    command: >
+      python run_translation_vllm.py
+      --model ${MODEL_NAME}
+      --parallel-requests ${PARALLEL_REQUESTS}
