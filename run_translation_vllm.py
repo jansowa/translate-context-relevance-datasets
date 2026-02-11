@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import logging
 import os
 import queue
 import random
@@ -30,6 +31,17 @@ from translate_context_relevance_dataset import (
     translate_text_with_span_repair,
     write_json_atomic,
 )
+
+
+def format_seconds(seconds: float) -> str:
+    if seconds < 0:
+        seconds = 0
+    total = int(seconds)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
 
 @dataclass
@@ -202,6 +214,7 @@ def writer_loop(
             write_json_atomic(item.ckpt_path, state)
             q.task_done()
     except BaseException as exc:  # noqa: BLE001
+        logging.exception("Writer loop failed")
         write_errors.append(exc)
 
 
@@ -227,11 +240,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-rows", type=int, default=0, help="0 = all")
     p.add_argument("--skip-rows", type=int, default=0)
     p.add_argument("--keep-original-columns", default=True, action="store_true")
+    p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    p.add_argument("--log-every", type=int, default=10, help="Log progress every N completed rows in non-TTY mode")
     return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     if args.checkpoint_dir is None:
         args.checkpoint_dir = os.path.join(args.out_dir, "checkpoints")
@@ -265,6 +285,19 @@ def main() -> int:
         print("Nothing to translate (all rows already done in selected window).")
         return 0
 
+    logging.info(
+        "Translation run: dataset=%s split=%s model=%s parallel=%d range=%d..%d total_in_range=%d pending=%d done_before=%d",
+        args.dataset,
+        args.split,
+        args.model,
+        max(1, args.parallel_requests),
+        start_idx,
+        end_idx - 1,
+        end_idx - start_idx,
+        len(candidates),
+        (end_idx - start_idx) - len(candidates),
+    )
+
     api_key_last6 = args.api_key[-6:] if args.api_key else "EMPTY"
     result_queue: "queue.Queue[Optional[RowResult]]" = queue.Queue(maxsize=max(4, args.parallel_requests * 2))
     write_errors: List[BaseException] = []
@@ -275,8 +308,20 @@ def main() -> int:
         daemon=True,
     )
     writer.start()
+    logging.info("Writer thread started. Output: %s", out_jsonl)
 
-    pbar = tqdm(total=len(candidates), desc="Completed rows", unit="row")
+    non_tty_progress = not sys.stderr.isatty()
+    pbar = tqdm(
+        total=len(candidates),
+        desc="Completed rows",
+        unit="row",
+        dynamic_ncols=True,
+        mininterval=0.5,
+        disable=non_tty_progress,
+    )
+    started_at = time.time()
+    completed = 0
+    log_every = max(1, int(args.log_every))
 
     try:
         with ThreadPoolExecutor(max_workers=max(1, args.parallel_requests)) as executor:
@@ -296,6 +341,22 @@ def main() -> int:
 
                 result_queue.put(result)
                 pbar.update(1)
+                completed += 1
+                if non_tty_progress and (
+                    completed == 1 or completed % log_every == 0 or completed == len(candidates)
+                ):
+                    elapsed = time.time() - started_at
+                    rate = completed / elapsed if elapsed > 0 else 0.0
+                    eta_seconds = (len(candidates) - completed) / rate if rate > 0 else 0.0
+                    logging.info(
+                        "Progress: %d/%d rows (%.1f%%), rate=%.2f row/s, elapsed=%s, eta=%s",
+                        completed,
+                        len(candidates),
+                        100.0 * completed / len(candidates),
+                        rate,
+                        format_seconds(elapsed),
+                        format_seconds(eta_seconds),
+                    )
 
         result_queue.join()
         if write_errors:
@@ -305,7 +366,7 @@ def main() -> int:
         result_queue.put(None)
         writer.join(timeout=10)
 
-    print(f"Done. Output: {out_jsonl}")
+    logging.info("Done. Output: %s", out_jsonl)
     return 0
 
 

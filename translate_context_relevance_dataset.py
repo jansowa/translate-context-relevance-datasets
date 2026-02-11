@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import json
+import logging
 import os
 import random
 import re
@@ -46,6 +47,17 @@ def _is_rate_limited(exc: BaseException) -> bool:
         return True
 
     return False
+
+
+def format_seconds(seconds: float) -> str:
+    if seconds < 0:
+        seconds = 0
+    total = int(seconds)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
 
 # ---------------------------
@@ -574,17 +586,37 @@ def run_translate(args: argparse.Namespace, runner: ComboRunner) -> None:
     target_ids = set(ds[i]["id"] for i in range(start_idx, end_idx))
     already_done = len(done_ids.intersection(target_ids))
 
+    non_tty_progress = not sys.stderr.isatty()
     pbar_rows = tqdm(
         total=window_count,
         initial=min(already_done, window_count),
         desc=f"Completed rows (idx {start_idx}..{end_idx - 1})",
         unit="row",
+        dynamic_ncols=True,
+        mininterval=0.5,
+        disable=non_tty_progress,
+    )
+    completed_rows = min(already_done, window_count)
+    started_at = time.time()
+    log_every = max(1, int(args.log_every))
+    total_pending = max(0, window_count - already_done)
+
+    logging.info(
+        "Translation run: dataset=%s split=%s range=%d..%d total_in_range=%d pending=%d done_before=%d combos=%d",
+        args.dataset,
+        args.split,
+        start_idx,
+        end_idx - 1,
+        window_count,
+        total_pending,
+        already_done,
+        len(runner.combos),
     )
 
     combo, client = None, None
     if runner.has_next():
         combo, client = runner.next_combo()
-        print(f"Start combo: model={combo.model}, key=***{combo.api_key[-6:]}")
+        logging.info("Start combo: model=%s key=***%s", combo.model, combo.api_key[-6:])
     else:
         raise RuntimeError("No available api_key × model combinations.")
 
@@ -632,6 +664,9 @@ def run_translate(args: argparse.Namespace, runner: ComboRunner) -> None:
             desc=f"id={rid} (ds_idx={ds_idx})",
             unit="step",
             leave=False,
+            dynamic_ncols=True,
+            mininterval=0.5,
+            disable=non_tty_progress,
         )
 
         def ensure_combo():
@@ -640,7 +675,7 @@ def run_translate(args: argparse.Namespace, runner: ComboRunner) -> None:
                 if not runner.has_next():
                     raise RuntimeError("Ran out of api_key × model combinations (rate-limited or errors everywhere).")
                 combo, client = runner.next_combo()
-                print(f"\nSwitch combo: model={combo.model}, key=***{combo.api_key[-6:]}")
+                logging.info("Switch combo: model=%s key=***%s", combo.model, combo.api_key[-6:])
 
         # --- translate query once
         while not state.get("query_pl"):
@@ -782,13 +817,31 @@ def run_translate(args: argparse.Namespace, runner: ComboRunner) -> None:
             write_json_atomic(ckpt_path, state)
 
             pbar_rows.update(1)
+            completed_rows += 1
+            if non_tty_progress and (
+                completed_rows == already_done + 1
+                or (completed_rows - already_done) % log_every == 0
+                or completed_rows == window_count
+            ):
+                elapsed = time.time() - started_at
+                rate = (completed_rows - already_done) / elapsed if elapsed > 0 else 0.0
+                eta_seconds = (window_count - completed_rows) / rate if rate > 0 else 0.0
+                logging.info(
+                    "Progress: %d/%d rows (%.1f%%), rate=%.2f row/s, elapsed=%s, eta=%s",
+                    completed_rows,
+                    window_count,
+                    100.0 * completed_rows / window_count,
+                    rate,
+                    format_seconds(elapsed),
+                    format_seconds(eta_seconds),
+                )
 
     pbar_rows.close()
-    print(f"\nDone. Output: {out_jsonl}")
+    logging.info("Done. Output: %s", out_jsonl)
     if runner.exhausted:
-        print("Exhausted combinations (429):")
+        logging.warning("Exhausted combinations (429):")
         for c in runner.exhausted:
-            print(f" - model={c.model}, key=***{c.api_key[-6:]}")
+            logging.warning(" - model=%s key=***%s", c.model, c.api_key[-6:])
 
 
 # ---------------------------
@@ -825,6 +878,8 @@ def main() -> int:
     p.add_argument("--max-rows", type=int, default=0, help="0 = all")
     p.add_argument("--keep-original-columns", default=True, action="store_true", help="Keep original EN columns in the JSONL.")
     p.add_argument("--max-prompt-attempts", type=int, default=4, help="How many increasingly strict prompts to try for spans.")
+    p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    p.add_argument("--log-every", type=int, default=10, help="Log progress every N completed rows in non-TTY mode")
 
     p.add_argument(
         "--skip-rows",
@@ -834,6 +889,11 @@ def main() -> int:
     )
 
     args = p.parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     api_keys = parse_csv_list(args.api_keys)
     models = parse_csv_list(args.models)
