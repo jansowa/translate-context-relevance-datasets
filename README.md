@@ -1,88 +1,107 @@
-# Translate context relevance dataset
+# Translate context relevance dataset (EN → PL)
 
-A script for translating the HuggingFace dataset `zilliz/natural_questions-context-relevance-with-think` from EN→PL.
+This repository provides a tool for translating the HuggingFace dataset `zilliz/natural_questions-context-relevance-with-think` from English to Polish.
 
-It writes the output to JSONL and uses checkpoints so the process can be resumed.
-It also supports a list of **API keys** and a list of **models**: for each `api_key × model` combination,
-it sends requests until it receives a response associated with hitting the limit (most commonly HTTP **429**),
-then automatically switches to the next combination.
-
-> Note: The exact meaning of “limits” depends on the API provider. The script treats HTTP **429** (and closely related rate/quota errors) as “limit reached”.
-
----
+The pipeline runs locally using **vLLM (OpenAI-compatible API)** and a separate **translator** container.
+Results are written to JSONL, and progress is persisted with checkpoints so the process can be safely resumed.
 
 ## Requirements
 
-- Python 3.10+ (recommended)
-- Internet access (to download the dataset from HuggingFace)
-- Libraries: `openai`, `datasets`, `tqdm`
+- Docker + Docker Compose
+- NVIDIA GPU (for vLLM) with a working GPU container runtime
 
----
+## Configuration
 
-## Setup (venv)
-
-```bash
-python -m venv .venv
-# Linux / macOS:
-source .venv/bin/activate
-# Windows (PowerShell):
-# .venv\Scripts\Activate.ps1
-
-python -m pip install -U pip
-pip install openai==1.64.0 datasets==3.3.2 tqdm==4.67.1
-````
-
-Optionally freeze dependencies:
+Copy an environment profile:
 
 ```bash
-pip freeze > requirements.txt
+cp .env.example .env
 ```
 
----
+Key variables in `.env`:
 
-## Usage (translate dataset with checkpoints)
+- `MODEL_NAME` – model name served by vLLM
+- `PARALLEL_REQUESTS` – number of parallel requests on the translator side (`ThreadPoolExecutor`)
+- `PROGRESS_BAR` – translation progress display mode: `on` (default), `auto` (TTY only), `off`
+- `PROGRESS_METRIC` – progress metric for `tqdm`: `checkpoints` (default), `rows`, `both`
+- `GPU_COUNT` – number of GPUs used by vLLM (`--tensor-parallel-size`)
+- `VLLM_QUANTIZATION` (optional) – vLLM quantization mode; leave empty for full precision (for example `awq`)
 
-Minimal example:
+Available profiles:
+
+- `.env.example` – lightweight profile (defaults to `Qwen/Qwen2.5-0.5B-Instruct`, `PARALLEL_REQUESTS=2`, `GPU_COUNT=1`)
+- `.env.gptoss` – multi-GPU profile (`openai/gpt-oss-120b`, `PARALLEL_REQUESTS=16`, `GPU_COUNT=4`)
+- `.env.bielikq4` – Bielik 11B in 4-bit AWQ quantization (`speakleash/Bielik-11B-v3.0-Instruct-AWQ`, `VLLM_QUANTIZATION=awq`)
+
+
+## Running
+
+1. Start vLLM:
 
 ```bash
-python translate_context_relevance_dataset.py \
-  --base-url "https://your-provider.example/v1" \
-  --api-keys "KEY_1,KEY_2" \
-  --models "modelA,modelB"
+docker compose up -d --build vllm
 ```
 
-What you get:
+2. Start translation:
 
-* `out_pl/translated.jsonl` – final output (one record per line),
-* `out_pl/checkpoints/*.json` – per-`id` checkpoints (allow resuming).
-
-Resume:
-
-* Run again with the same parameters; the script will skip `id`s already present in `translated.jsonl`
-  and continue unfinished work based on checkpoints.
-
----
-
-## Key CLI parameters
-
-* `--api-keys` – list of keys (separator: `,` or `;`)
-* `--models` – list of models (separator: `,` or `;`)
-* `--base-url` – API base URL (optional)
-* `--delay-seconds` – delay after each successful request
-* `--max-retries` – retries for errors other than 429
-* `--skip-rows` – skip the first N dataset examples (e.g., 5000 => start from example #5001)
-* `--max-rows` – number of examples to process after skipping (0 = all remaining)
-* `--max-prompt-attempts` – how many increasingly strict prompts to try when the model breaks span structure
-
----
-
-## Notes
-
-* The script detects “limit reached” mainly via HTTP 429 status / related exceptions.
-* For non-limit errors, it retries with exponential backoff.
-* When a given `api_key × model` hits a limit, the script switches to the next combination and continues from checkpoints.
-* Existing lines in `translated.jsonl` are **not modified or removed**; new translations are appended as new lines.
-
+```bash
+docker compose run --rm translator
 ```
-::contentReference[oaicite:0]{index=0}
+
+## First test on a small GPU (e.g. 8 GB VRAM)
+
+Recommended quick end-to-end test:
+
+```bash
+cp .env.example .env
+docker compose up -d --build vllm
+docker compose run --rm translator --max-rows 5
 ```
+
+If you hit GPU OOM:
+
+- set `PARALLEL_REQUESTS=1`
+- reduce `MAX_MODEL_LEN` (for example to `1024`)
+- make sure you are using the small model profile from `.env.example`
+
+## Output and checkpoints
+
+Output files are written inside the repository directory:
+
+- `out_pl/translated.jsonl` – final output (1 record per line)
+- `out_pl/checkpoints/*.json` – per-`id` checkpoints
+
+You can resume processing by running the translator again with the same parameters.
+Already completed records are skipped.
+For correct interactive `tqdm` rendering, run the translator with `docker compose run --rm translator`.
+
+## Architecture
+
+`docker-compose.yml` starts two services:
+
+- `vllm` – OpenAI-compatible endpoint at `http://vllm:8000/v1`
+- `translator` – client service that:
+  - reads dataset rows,
+  - translates queries and documents,
+  - preserves output/checkpoint format compatible with the existing workflow,
+  - sends requests in parallel via `ThreadPoolExecutor`,
+  - serializes disk writes through a dedicated writer thread (queue) to reduce worker blocking.
+
+## Dependencies (uv + requirements)
+
+In the translator image, dependencies are installed via `uv` from `requirements.txt`.
+The source dependency file is `requirements.in`.
+
+Update pinned dependencies:
+
+```bash
+uv pip compile requirements.in -o requirements.txt
+```
+
+## Original script
+
+The repository still includes the original script:
+
+- `translate_context_relevance_dataset.py`
+
+It was not removed or modified.

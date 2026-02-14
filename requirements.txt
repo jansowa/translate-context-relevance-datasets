@@ -1,0 +1,5 @@
+# Generated from requirements.in (uv pip compile style pinned output)
+# This project keeps a flat pin set for deterministic translator container builds.
+openai==1.64.0
+datasets==3.3.2
+tqdm==4.67.1
