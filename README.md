@@ -23,6 +23,7 @@ Key variables in `.env`:
 - `MODEL_NAME` – model name served by vLLM
 - `PARALLEL_REQUESTS` – number of parallel requests on the translator side (`ThreadPoolExecutor`)
 - `PROGRESS_BAR` – translation progress display mode: `on` (default), `auto` (TTY only), `off`
+- `PROGRESS_METRIC` – progress metric for `tqdm`: `checkpoints` (default), `rows`, `both`
 - `GPU_COUNT` – number of GPUs used by vLLM (`--tensor-parallel-size`)
 - `VLLM_QUANTIZATION` (optional) – vLLM quantization mode; leave empty for full precision (for example `awq`)
 
@@ -44,7 +45,7 @@ docker compose up -d --build vllm
 2. Start translation:
 
 ```bash
-docker compose up translator
+docker compose run --rm translator
 ```
 
 ## First test on a small GPU (e.g. 8 GB VRAM)
@@ -72,6 +73,7 @@ Output files are written inside the repository directory:
 
 You can resume processing by running the translator again with the same parameters.
 Already completed records are skipped.
+For correct interactive `tqdm` rendering, run the translator with `docker compose run --rm translator`.
 
 ## Architecture
 
