@@ -60,6 +60,21 @@ def format_seconds(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+def quiet_external_loggers() -> None:
+    # Keep translator progress visible, but suppress per-request noise from dependencies.
+    noisy = (
+        "httpx",
+        "httpcore",
+        "openai",
+        "datasets",
+        "huggingface_hub",
+        "fsspec",
+        "urllib3",
+    )
+    for name in noisy:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 # ---------------------------
 # JSON fixing
 # ---------------------------
@@ -893,7 +908,9 @@ def main() -> int:
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
     )
+    quiet_external_loggers()
 
     api_keys = parse_csv_list(args.api_keys)
     models = parse_csv_list(args.models)

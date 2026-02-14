@@ -11,7 +11,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from datasets import load_dataset
 from openai import OpenAI
@@ -44,6 +44,21 @@ def format_seconds(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+def quiet_external_loggers() -> None:
+    # Keep translator progress visible, but suppress per-request noise from dependencies.
+    noisy = (
+        "httpx",
+        "httpcore",
+        "openai",
+        "datasets",
+        "huggingface_hub",
+        "fsspec",
+        "urllib3",
+    )
+    for name in noisy:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 @dataclass
 class RowResult:
     rid: str
@@ -51,11 +66,62 @@ class RowResult:
     out_row: Dict[str, Any]
 
 
+def checkpoint_is_complete(state: Dict[str, Any], expected_texts: int) -> bool:
+    texts_pl = state.get("texts_pl")
+    spans_pl = state.get("context_spans_pl")
+    think_pl = state.get("think_process_pl")
+    if not state.get("query_pl"):
+        return False
+    if not isinstance(texts_pl, list) or not isinstance(spans_pl, list) or not isinstance(think_pl, list):
+        return False
+    if len(texts_pl) != expected_texts or len(spans_pl) != expected_texts or len(think_pl) != expected_texts:
+        return False
+    if any(x is None for x in texts_pl):
+        return False
+    if any(x is None for x in spans_pl):
+        return False
+    if any(x is None for x in think_pl):
+        return False
+    return True
+
+
+def build_out_row_from_state(
+    state: Dict[str, Any],
+    row: Dict[str, Any],
+    ds_idx: int,
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
+    out_row = {
+        "id": row["id"],
+        "query": state["query_pl"],
+        "texts": state["texts_pl"],
+        "context_spans": state["context_spans_pl"],
+        "context_spans_relevance": row["context_spans_relevance"],
+        "labels": row["labels"],
+        "think_process": state["think_process_pl"],
+        "translation_model": state.get("active_model"),
+        "translation_key_last6": state.get("active_key_last6"),
+        "translation_base_url": (args.base_url or None),
+        "dataset_index": ds_idx,
+    }
+    if args.keep_original_columns:
+        out_row.update(
+            {
+                "query_en": row["query"],
+                "texts_en": row["texts"],
+                "context_spans_en": row["context_spans"],
+                "think_process_en": row["think_process"],
+            }
+        )
+    return out_row
+
+
 def process_row(
     row: Dict[str, Any],
     ds_idx: int,
     args: argparse.Namespace,
     api_key_last6: str,
+    unit_done_callback: Optional[Callable[[int], None]] = None,
 ) -> RowResult:
     client = OpenAI(api_key=args.api_key, base_url=args.base_url)
 
@@ -119,6 +185,8 @@ def process_row(
         state["active_model"] = args.model
         state["active_key_last6"] = api_key_last6
         write_json_atomic(ckpt_path, state)
+        if unit_done_callback:
+            unit_done_callback(1)
 
     query_pl = state["query_pl"]
     done_idxs = set(state.get("done_text_idxs", []))
@@ -163,6 +231,8 @@ def process_row(
         state["active_model"] = args.model
         state["active_key_last6"] = api_key_last6
         write_json_atomic(ckpt_path, state)
+        if unit_done_callback:
+            unit_done_callback(1)
 
     out_row = {
         "id": rid,
@@ -242,6 +312,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--keep-original-columns", default=True, action="store_true")
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     p.add_argument("--log-every", type=int, default=10, help="Log progress every N completed rows in non-TTY mode")
+    p.add_argument(
+        "--progress-bar",
+        default=os.getenv("PROGRESS_BAR", "on"),
+        choices=["auto", "on", "off"],
+        help="Progress bar mode: auto=TTY only, on=always, off=disable tqdm",
+    )
+    p.add_argument(
+        "--progress-metric",
+        default=os.getenv("PROGRESS_METRIC", "checkpoints"),
+        choices=["checkpoints", "rows", "both"],
+        help="What tqdm should display: checkpoints (query+text units), rows, or both",
+    )
     return p.parse_args()
 
 
@@ -251,7 +333,9 @@ def main() -> int:
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
     )
+    quiet_external_loggers()
 
     if args.checkpoint_dir is None:
         args.checkpoint_dir = os.path.join(args.out_dir, "checkpoints")
@@ -274,19 +358,42 @@ def main() -> int:
     start_idx = skip
     end_idx = min(total, start_idx + int(args.max_rows)) if args.max_rows and args.max_rows > 0 else total
 
-    candidates: List[Tuple[int, Dict[str, Any]]] = []
+    recovered_from_ckpt = 0
+    candidates_with_ckpt: List[Tuple[int, Dict[str, Any]]] = []
+    candidates_fresh: List[Tuple[int, Dict[str, Any]]] = []
     for ds_idx in range(start_idx, end_idx):
         row = ds[ds_idx]
-        if row["id"] in done_ids:
+        rid = row["id"]
+        if rid in done_ids:
             continue
-        candidates.append((ds_idx, row))
+
+        stem = checkpoint_stem_from_id(rid)
+        ckpt_path = os.path.join(args.checkpoint_dir, f"{stem}.json")
+        state = read_json(ckpt_path) or {}
+
+        # If checkpoint already contains a full row, flush it to JSONL and mark as done.
+        if state and checkpoint_is_complete(state, expected_texts=len(row["texts"])):
+            append_jsonl(out_jsonl, build_out_row_from_state(state, row, ds_idx, args))
+            done_ids.add(rid)
+            state["status"] = "done"
+            write_json_atomic(ckpt_path, state)
+            recovered_from_ckpt += 1
+            continue
+
+        if state:
+            candidates_with_ckpt.append((ds_idx, row))
+        else:
+            candidates_fresh.append((ds_idx, row))
+
+    # Prefer closing already-started rows before opening new checkpoints.
+    candidates = candidates_with_ckpt + candidates_fresh
 
     if not candidates:
         print("Nothing to translate (all rows already done in selected window).")
         return 0
 
     logging.info(
-        "Translation run: dataset=%s split=%s model=%s parallel=%d range=%d..%d total_in_range=%d pending=%d done_before=%d",
+        "Translation run: dataset=%s split=%s model=%s parallel=%d range=%d..%d total_in_range=%d pending=%d done_before=%d recovered_from_checkpoints=%d pending_with_checkpoints=%d pending_new=%d",
         args.dataset,
         args.split,
         args.model,
@@ -296,6 +403,9 @@ def main() -> int:
         end_idx - start_idx,
         len(candidates),
         (end_idx - start_idx) - len(candidates),
+        recovered_from_ckpt,
+        len(candidates_with_ckpt),
+        len(candidates_fresh),
     )
 
     api_key_last6 = args.api_key[-6:] if args.api_key else "EMPTY"
@@ -310,23 +420,73 @@ def main() -> int:
     writer.start()
     logging.info("Writer thread started. Output: %s", out_jsonl)
 
-    non_tty_progress = not sys.stderr.isatty()
-    pbar = tqdm(
+    total_units = 0
+    done_units_before = 0
+    for ds_idx, row in candidates:
+        row_units = 1 + len(row["texts"])
+        total_units += row_units
+
+        rid = row["id"]
+        stem = checkpoint_stem_from_id(rid)
+        ckpt_path = os.path.join(args.checkpoint_dir, f"{stem}.json")
+        state = read_json(ckpt_path) or {}
+
+        if state.get("query_pl"):
+            done_units_before += 1
+
+        done_idxs = {int(x) for x in state.get("done_text_idxs", []) if isinstance(x, int)}
+        done_units_before += len([i for i in done_idxs if 0 <= i < len(row["texts"])])
+
+    if total_units > 0:
+        done_units_before = min(done_units_before, total_units)
+    logging.info(
+        "Checkpoint units: %d/%d done at start (unit = query + one text)",
+        done_units_before,
+        total_units,
+    )
+
+    is_tty = sys.stderr.isatty()
+    show_pbar = args.progress_bar == "on" or (args.progress_bar == "auto" and is_tty)
+    non_tty_progress = not is_tty
+    show_rows_bar = args.progress_metric in ("rows", "both")
+    show_units_bar = args.progress_metric in ("checkpoints", "both")
+    pbar_rows = tqdm(
         total=len(candidates),
         desc="Completed rows",
         unit="row",
         dynamic_ncols=True,
         mininterval=0.5,
-        disable=non_tty_progress,
+        ascii=not is_tty,
+        disable=(not show_pbar) or (not show_rows_bar),
+    )
+    pbar_units = tqdm(
+        total=total_units,
+        initial=done_units_before,
+        desc="Checkpoint units",
+        unit="unit",
+        dynamic_ncols=True,
+        mininterval=0.5,
+        ascii=not is_tty,
+        disable=(not show_pbar) or (not show_units_bar),
     )
     started_at = time.time()
     completed = 0
     log_every = max(1, int(args.log_every))
+    completed_units = done_units_before
+    units_lock = threading.Lock()
+
+    def mark_units_done(increment: int) -> None:
+        nonlocal completed_units
+        if increment <= 0:
+            return
+        with units_lock:
+            completed_units += increment
+            pbar_units.update(increment)
 
     try:
         with ThreadPoolExecutor(max_workers=max(1, args.parallel_requests)) as executor:
             futures = [
-                executor.submit(process_row, row, ds_idx, args, api_key_last6)
+                executor.submit(process_row, row, ds_idx, args, api_key_last6, mark_units_done)
                 for ds_idx, row in candidates
             ]
 
@@ -340,19 +500,23 @@ def main() -> int:
                     raise
 
                 result_queue.put(result)
-                pbar.update(1)
+                pbar_rows.update(1)
                 completed += 1
-                if non_tty_progress and (
+                if (non_tty_progress and not show_pbar) and (
                     completed == 1 or completed % log_every == 0 or completed == len(candidates)
                 ):
                     elapsed = time.time() - started_at
                     rate = completed / elapsed if elapsed > 0 else 0.0
                     eta_seconds = (len(candidates) - completed) / rate if rate > 0 else 0.0
+                    with units_lock:
+                        units_done_now = completed_units
                     logging.info(
-                        "Progress: %d/%d rows (%.1f%%), rate=%.2f row/s, elapsed=%s, eta=%s",
+                        "Progress: %d/%d rows (%.1f%%), units=%d/%d, rate=%.2f row/s, elapsed=%s, eta=%s",
                         completed,
                         len(candidates),
                         100.0 * completed / len(candidates),
+                        units_done_now,
+                        total_units,
                         rate,
                         format_seconds(elapsed),
                         format_seconds(eta_seconds),
@@ -362,7 +526,8 @@ def main() -> int:
         if write_errors:
             raise RuntimeError(f"Writer thread failed: {write_errors[0]}") from write_errors[0]
     finally:
-        pbar.close()
+        pbar_rows.close()
+        pbar_units.close()
         result_queue.put(None)
         writer.join(timeout=10)
 

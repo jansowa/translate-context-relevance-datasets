@@ -3,19 +3,20 @@ services:
     image: vllm/vllm-openai:v0.8.5.post1
     env_file:
       - .env
+    entrypoint: ["/bin/sh", "-lc"]
     command:
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8000"
-      - --model
-      - ${MODEL_NAME}
-      - --tensor-parallel-size
-      - ${GPU_COUNT}
-      - --gpu-memory-utilization
-      - ${GPU_MEMORY_UTILIZATION:-0.9}
-      - --max-model-len
-      - ${MAX_MODEL_LEN:-4096}
+      - |
+        set -eu
+        set -- --host 0.0.0.0 \
+          --port 8000 \
+          --model "${MODEL_NAME}" \
+          --tensor-parallel-size "${GPU_COUNT}" \
+          --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.9}" \
+          --max-model-len "${MAX_MODEL_LEN:-4096}"
+        if [ -n "${VLLM_QUANTIZATION:-}" ]; then
+          set -- "$@" --quantization "${VLLM_QUANTIZATION}"
+        fi
+        exec python3 -m vllm.entrypoints.openai.api_server "$@"
     ports:
       - "${VLLM_PORT:-8000}:8000"
     deploy:

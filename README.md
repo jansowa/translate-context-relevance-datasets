@@ -22,12 +22,16 @@ Key variables in `.env`:
 
 - `MODEL_NAME` – model name served by vLLM
 - `PARALLEL_REQUESTS` – number of parallel requests on the translator side (`ThreadPoolExecutor`)
+- `PROGRESS_BAR` – translation progress display mode: `on` (default), `auto` (TTY only), `off`
 - `GPU_COUNT` – number of GPUs used by vLLM (`--tensor-parallel-size`)
+- `VLLM_QUANTIZATION` (optional) – vLLM quantization mode; leave empty for full precision (for example `awq`)
 
 Available profiles:
 
 - `.env.example` – lightweight profile (defaults to `Qwen/Qwen2.5-0.5B-Instruct`, `PARALLEL_REQUESTS=2`, `GPU_COUNT=1`)
 - `.env.gptoss` – multi-GPU profile (`openai/gpt-oss-120b`, `PARALLEL_REQUESTS=16`, `GPU_COUNT=4`)
+- `.env.bielikq4` – Bielik 11B in 4-bit AWQ quantization (`speakleash/Bielik-11B-v3.0-Instruct-AWQ`, `VLLM_QUANTIZATION=awq`)
+
 
 ## Running
 
