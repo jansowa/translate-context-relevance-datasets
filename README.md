@@ -1,4 +1,4 @@
-# Translate context relevance dataset (EN → PL)
+# Translate context relevance dataset (EN -> PL)
 
 This repository provides a tool for translating the HuggingFace dataset `zilliz/natural_questions-context-relevance-with-think` from English to Polish.
 
@@ -20,19 +20,21 @@ cp .env.example .env
 
 Key variables in `.env`:
 
-- `MODEL_NAME` – model name served by vLLM
-- `PARALLEL_REQUESTS` – number of parallel requests on the translator side (`ThreadPoolExecutor`)
-- `PROGRESS_BAR` – translation progress display mode: `on` (default), `auto` (TTY only), `off`
-- `PROGRESS_METRIC` – progress metric for `tqdm`: `checkpoints` (default), `rows`, `both`
-- `GPU_COUNT` – number of GPUs used by vLLM (`--tensor-parallel-size`)
-- `VLLM_QUANTIZATION` (optional) – vLLM quantization mode; leave empty for full precision (for example `awq`)
+- `MODEL_NAME` - model name served by vLLM
+- `PARALLEL_REQUESTS` - number of parallel requests on the translator side (`ThreadPoolExecutor`)
+- `PROGRESS_BAR` - translation progress display mode: `on` (default), `auto` (TTY only), `off`
+- `PROGRESS_METRIC` - progress metric for `tqdm`: `checkpoints` (default), `rows`, `both`
+- `GPU_COUNT` - number of GPUs used by vLLM (`--tensor-parallel-size`)
+- `VLLM_QUANTIZATION` (optional) - vLLM quantization mode; leave empty to let vLLM auto-detect model quantization
+- `VLLM_MAX_NUM_SEQS` (optional) - passed to `--max-num-seqs` only when set
+- `VLLM_MAX_NUM_BATCHED_TOKENS` (optional) - passed to `--max-num-batched-tokens` only when set
+- `VLLM_ENFORCE_EAGER` (optional) - if set to `1`, enables `--enforce-eager`
 
 Available profiles:
 
-- `.env.example` – lightweight profile (defaults to `Qwen/Qwen2.5-0.5B-Instruct`, `PARALLEL_REQUESTS=2`, `GPU_COUNT=1`)
-- `.env.gptoss` – multi-GPU profile (`openai/gpt-oss-120b`, `PARALLEL_REQUESTS=16`, `GPU_COUNT=4`)
-- `.env.bielikq4` – Bielik 11B in 4-bit AWQ quantization (`speakleash/Bielik-11B-v3.0-Instruct-AWQ`, `VLLM_QUANTIZATION=awq`)
-
+- `.env.example` - lightweight profile (defaults to `Qwen/Qwen2.5-0.5B-Instruct`, `PARALLEL_REQUESTS=2`, `GPU_COUNT=1`)
+- `.env.gptoss` - multi-GPU profile (`openai/gpt-oss-120b`, `PARALLEL_REQUESTS=16`, `GPU_COUNT=4`)
+- `.env.bielikq4` - Bielik 11B in 4-bit AWQ quantization with 16 GB-friendly tuning (`speakleash/Bielik-11B-v3.0-Instruct-awq`, `VLLM_QUANTIZATION=awq`, `PARALLEL_REQUESTS=1`)
 
 ## Running
 
@@ -62,14 +64,17 @@ If you hit GPU OOM:
 
 - set `PARALLEL_REQUESTS=1`
 - reduce `MAX_MODEL_LEN` (for example to `1024`)
+- set `VLLM_MAX_NUM_SEQS=1`
+- set `VLLM_MAX_NUM_BATCHED_TOKENS` to your `MAX_MODEL_LEN`
+- set `VLLM_ENFORCE_EAGER=1`
 - make sure you are using the small model profile from `.env.example`
 
 ## Output and checkpoints
 
 Output files are written inside the repository directory:
 
-- `out_pl/translated.jsonl` – final output (1 record per line)
-- `out_pl/checkpoints/*.json` – per-`id` checkpoints
+- `out_pl/translated.jsonl` - final output (1 record per line)
+- `out_pl/checkpoints/*.json` - per-`id` checkpoints
 
 You can resume processing by running the translator again with the same parameters.
 Already completed records are skipped.
@@ -79,8 +84,8 @@ For correct interactive `tqdm` rendering, run the translator with `docker compos
 
 `docker-compose.yml` starts two services:
 
-- `vllm` – OpenAI-compatible endpoint at `http://vllm:8000/v1`
-- `translator` – client service that:
+- `vllm` - OpenAI-compatible endpoint at `http://vllm:8000/v1`
+- `translator` - client service that:
   - reads dataset rows,
   - translates queries and documents,
   - preserves output/checkpoint format compatible with the existing workflow,
