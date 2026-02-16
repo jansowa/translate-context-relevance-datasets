@@ -74,11 +74,19 @@ If you hit GPU OOM:
 Output files are written inside the repository directory:
 
 - `out_pl/translated.jsonl` - final output (1 record per line)
+- `out_pl/failed_rows.jsonl` - rows that failed translation validation/runtime (appended)
 - `out_pl/checkpoints/*.json` - per-`id` checkpoints
 
 You can resume processing by running the translator again with the same parameters.
 Already completed records are skipped.
 For correct interactive `tqdm` rendering, run the translator with `docker compose run --rm translator`.
+
+Runtime behavior:
+
+- the translator uses structured output (`response_format=json_schema` when supported, with fallback to `json_object`) to enforce translation shape
+- row-level failures do not stop the whole run by default; they are logged to `out_pl/failed_rows.jsonl`
+- use `--fail-fast` to stop the entire run on the first failed row
+- use `--failed-jsonl-name <name>` to change the failed-rows file name
 
 ## Architecture
 

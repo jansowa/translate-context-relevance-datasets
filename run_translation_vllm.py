@@ -10,7 +10,7 @@ import random
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable
 
 from datasets import load_dataset
 from openai import AsyncOpenAI
@@ -66,7 +66,7 @@ def quiet_external_loggers() -> None:
 class RowResult:
     rid: str
     ckpt_path: str
-    out_row: Dict[str, Any]
+    out_row: dict[str, Any]
 
 
 def _is_rate_limited(exc: BaseException) -> bool:
@@ -83,7 +83,7 @@ def _is_rate_limited(exc: BaseException) -> bool:
     return False
 
 
-def checkpoint_is_complete(state: Dict[str, Any], expected_texts: int) -> bool:
+def checkpoint_is_complete(state: dict[str, Any], expected_texts: int) -> bool:
     texts_pl = state.get("texts_pl")
     spans_pl = state.get("context_spans_pl")
     think_pl = state.get("think_process_pl")
@@ -103,11 +103,11 @@ def checkpoint_is_complete(state: Dict[str, Any], expected_texts: int) -> bool:
 
 
 def build_out_row_from_state(
-    state: Dict[str, Any],
-    row: Dict[str, Any],
+    state: dict[str, Any],
+    row: dict[str, Any],
     ds_idx: int,
     args: argparse.Namespace,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     out_row = {
         "id": row["id"],
         "query": state["query_pl"],
@@ -141,8 +141,10 @@ async def llm_call_json_async(
     temperature: float,
     max_retries: int,
     delay_seconds: float,
-) -> Dict[str, Any]:
-    last_err: Optional[BaseException] = None
+    response_schema: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    last_err: BaseException | None = None
+    schema_enabled = response_schema is not None
 
     for attempt in range(max_retries):
         try:
@@ -155,10 +157,16 @@ async def llm_call_json_async(
                 ],
             )
 
-            try:
+            if schema_enabled and response_schema is not None:
+                kwargs["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "translation_response",
+                        "schema": response_schema,
+                    },
+                }
+            else:
                 kwargs["response_format"] = {"type": "json_object"}
-            except Exception:
-                pass
 
             resp = await client.chat.completions.create(**kwargs)
             content = resp.choices[0].message.content or ""
@@ -178,9 +186,50 @@ async def llm_call_json_async(
             last_err = e
             if _is_rate_limited(e):
                 raise RateLimitReached(str(e)) from e
+            if schema_enabled:
+                msg = str(e).lower()
+                if "json_schema" in msg or "response_format" in msg:
+                    schema_enabled = False
+                    continue
             await asyncio.sleep(min(60, (2 ** attempt) + random.random()))
 
     raise RuntimeError(f"LLM call failed after retries: {last_err}") from last_err
+
+
+def build_translation_schema_list(n: int) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "translated_spans": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": n,
+                "maxItems": n,
+            },
+            "translated_think_process": {"type": "string"},
+        },
+        "required": ["translated_spans", "translated_think_process"],
+        "additionalProperties": False,
+    }
+
+
+def build_translation_schema_dict(n: int) -> dict[str, Any]:
+    keys = [str(i) for i in range(1, n + 1)]
+    span_properties = {k: {"type": "string"} for k in keys}
+    return {
+        "type": "object",
+        "properties": {
+            "translated_spans_dict": {
+                "type": "object",
+                "properties": span_properties,
+                "required": keys,
+                "additionalProperties": False,
+            },
+            "translated_think_process": {"type": "string"},
+        },
+        "required": ["translated_spans_dict", "translated_think_process"],
+        "additionalProperties": False,
+    }
 
 
 async def translate_text_with_span_repair_async(
@@ -189,25 +238,37 @@ async def translate_text_with_span_repair_async(
     query_en: str,
     query_pl: str,
     doc_label: int,
-    span_texts_en: List[str],
-    spans_rel_i: List[int],
+    span_texts_en: list[str],
+    spans_rel_i: list[int],
     think_process_en: str,
     *,
     delay_seconds: float,
     temperature: float,
     max_retries: int,
     max_attempts: int = 3,
-) -> Tuple[List[str], str]:
+) -> tuple[list[str], str]:
     n = len(span_texts_en)
 
-    prompts = [
-        build_text_prompt(query_en, query_pl, doc_label, span_texts_en, spans_rel_i, think_process_en),
-        build_text_prompt_strict(query_en, query_pl, doc_label, span_texts_en, spans_rel_i, think_process_en),
-        build_text_prompt_dictforced(query_en, query_pl, doc_label, span_texts_en, spans_rel_i, think_process_en),
+    schema_list = build_translation_schema_list(n)
+    schema_dict = build_translation_schema_dict(n)
+
+    prompt_specs = [
+        (
+            build_text_prompt(query_en, query_pl, doc_label, span_texts_en, spans_rel_i, think_process_en),
+            schema_list,
+        ),
+        (
+            build_text_prompt_strict(query_en, query_pl, doc_label, span_texts_en, spans_rel_i, think_process_en),
+            schema_list,
+        ),
+        (
+            build_text_prompt_dictforced(query_en, query_pl, doc_label, span_texts_en, spans_rel_i, think_process_en),
+            schema_dict,
+        ),
     ][:max_attempts]
 
     last_problem = None
-    for attempt_idx, prompt in enumerate(prompts, start=1):
+    for attempt_idx, (prompt, response_schema) in enumerate(prompt_specs, start=1):
         t_json = await llm_call_json_async(
             client=client,
             model=model,
@@ -216,6 +277,7 @@ async def translate_text_with_span_repair_async(
             temperature=temperature,
             max_retries=max_retries,
             delay_seconds=delay_seconds,
+            response_schema=response_schema,
         )
 
         if "translated_spans" in t_json:
@@ -251,17 +313,17 @@ async def translate_text_with_span_repair_async(
             last_problem = f"attempt {attempt_idx}: translated_spans_dict missing keys 1..{n} or bad types"
 
     raise RuntimeError(
-        f"Failed to obtain the correct number of spans after {len(prompts)} attempts. Last issue: {last_problem}"
+        f"Failed to obtain the correct number of spans after {len(prompt_specs)} attempts. Last issue: {last_problem}"
     )
 
 
 async def process_row(
-    row: Dict[str, Any],
+    row: dict[str, Any],
     ds_idx: int,
     args: argparse.Namespace,
     api_key_last6: str,
     client: AsyncOpenAI,
-    unit_done_callback: Optional[Callable[[int], None]] = None,
+    unit_done_callback: Callable[[int], None] | None = None,
 ) -> RowResult:
     rid = row["id"]
     stem = checkpoint_stem_from_id(rid)
@@ -285,11 +347,11 @@ async def process_row(
         await asyncio.to_thread(write_json_atomic, ckpt_path, state)
 
     query_en = row["query"]
-    texts: List[str] = row["texts"]
-    context_spans: List[List[List[int]]] = row["context_spans"]
-    context_spans_rel: List[List[int]] = row["context_spans_relevance"]
-    labels: List[int] = row["labels"]
-    think_process: List[str] = row["think_process"]
+    texts: list[str] = row["texts"]
+    context_spans: list[list[list[int]]] = row["context_spans"]
+    context_spans_rel: list[list[int]] = row["context_spans_relevance"]
+    labels: list[int] = row["labels"]
+    think_process: list[str] = row["think_process"]
 
     if not state.get("query_pl"):
         try:
@@ -399,10 +461,10 @@ async def process_row(
 
 
 async def writer_loop(
-    q: "asyncio.Queue[Optional[RowResult]]",
+    q: asyncio.Queue[RowResult | None],
     out_jsonl: str,
     done_ids: set,
-    write_errors: List[BaseException],
+    write_errors: list[BaseException],
 ) -> None:
     try:
         while True:
@@ -438,11 +500,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--max-retries", type=int, default=6)
     p.add_argument("--max-prompt-attempts", type=int, default=4)
+    p.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="Stop whole run on first row-level translation error.",
+    )
 
     p.add_argument("--dataset", default="zilliz/natural_questions-context-relevance-with-think")
     p.add_argument("--split", default="train", choices=["train", "validation", "test"])
     p.add_argument("--out-dir", default="out_pl")
     p.add_argument("--out-jsonl-name", default="translated.jsonl")
+    p.add_argument("--failed-jsonl-name", default="failed_rows.jsonl")
     p.add_argument("--checkpoint-dir", default=None)
     p.add_argument("--max-rows", type=int, default=0, help="0 = all")
     p.add_argument("--skip-rows", type=int, default=0)
@@ -472,6 +540,7 @@ async def run_async(args: argparse.Namespace) -> int:
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     out_jsonl = os.path.join(args.out_dir, args.out_jsonl_name)
+    failed_jsonl = os.path.join(args.out_dir, args.failed_jsonl_name)
     done_ids = load_done_ids_from_jsonl(out_jsonl)
 
     ds = load_dataset(args.dataset, split=args.split)
@@ -486,8 +555,8 @@ async def run_async(args: argparse.Namespace) -> int:
     end_idx = min(total, start_idx + int(args.max_rows)) if args.max_rows and args.max_rows > 0 else total
 
     recovered_from_ckpt = 0
-    candidates_with_ckpt: List[Tuple[int, Dict[str, Any]]] = []
-    candidates_fresh: List[Tuple[int, Dict[str, Any]]] = []
+    candidates_with_ckpt: list[tuple[int, dict[str, Any]]] = []
+    candidates_fresh: list[tuple[int, dict[str, Any]]] = []
     for ds_idx in range(start_idx, end_idx):
         row = ds[ds_idx]
         rid = row["id"]
@@ -534,15 +603,16 @@ async def run_async(args: argparse.Namespace) -> int:
     )
 
     api_key_last6 = args.api_key[-6:] if args.api_key else "EMPTY"
-    result_queue: "asyncio.Queue[Optional[RowResult]]" = asyncio.Queue(
+    result_queue: asyncio.Queue[RowResult | None] = asyncio.Queue(
         maxsize=max(4, args.parallel_requests * 2)
     )
-    write_errors: List[BaseException] = []
+    write_errors: list[BaseException] = []
 
     writer = asyncio.create_task(
         writer_loop(result_queue, out_jsonl, done_ids, write_errors)
     )
     logging.info("Writer task started. Output: %s", out_jsonl)
+    logging.info("Failed rows will be appended to: %s", failed_jsonl)
 
     total_units = 0
     done_units_before = 0
@@ -609,43 +679,83 @@ async def run_async(args: argparse.Namespace) -> int:
     sem = asyncio.Semaphore(max(1, args.parallel_requests))
 
     async with AsyncOpenAI(api_key=args.api_key, base_url=args.base_url) as client:
-        async def process_with_limit(ds_idx: int, row: Dict[str, Any]) -> RowResult:
+        async def process_with_limit(ds_idx: int, row: dict[str, Any]) -> RowResult:
             async with sem:
                 return await process_row(row, ds_idx, args, api_key_last6, client, mark_units_done)
 
         tasks = [asyncio.create_task(process_with_limit(ds_idx, row)) for ds_idx, row in candidates]
+        task_meta: dict[asyncio.Task[RowResult], tuple[int, str]] = {
+            task: (ds_idx, row["id"]) for task, (ds_idx, row) in zip(tasks, candidates)
+        }
+        failed_rows = 0
         try:
-            for fut in asyncio.as_completed(tasks):
+            pending_tasks = set(tasks)
+            while pending_tasks:
                 if write_errors:
                     raise RuntimeError(f"Writer task failed: {write_errors[0]}") from write_errors[0]
-                try:
-                    result = await fut
-                except RateLimitReached:
-                    await asyncio.sleep(1 + random.random())
-                    raise
+                done_now, pending_tasks = await asyncio.wait(
+                    pending_tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for fut in done_now:
+                    if write_errors:
+                        raise RuntimeError(f"Writer task failed: {write_errors[0]}") from write_errors[0]
+                    try:
+                        result = await fut
+                    except RateLimitReached:
+                        await asyncio.sleep(1 + random.random())
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        ds_idx, rid = task_meta.get(fut, (-1, "unknown"))
+                        failed_rows += 1
+                        if args.fail_fast:
+                            raise
 
-                await result_queue.put(result)
-                pbar_rows.update(1)
-                completed += 1
-                if (non_tty_progress and not show_pbar) and (
-                    completed == 1 or completed % log_every == 0 or completed == len(candidates)
-                ):
-                    elapsed = time.time() - started_at
-                    rate = completed / elapsed if elapsed > 0 else 0.0
-                    eta_seconds = (len(candidates) - completed) / rate if rate > 0 else 0.0
-                    async with units_lock:
-                        units_done_now = completed_units
-                    logging.info(
-                        "Progress: %d/%d rows (%.1f%%), units=%d/%d, rate=%.2f row/s, elapsed=%s, eta=%s",
-                        completed,
-                        len(candidates),
-                        100.0 * completed / len(candidates),
-                        units_done_now,
-                        total_units,
-                        rate,
-                        format_seconds(elapsed),
-                        format_seconds(eta_seconds),
-                    )
+                        logging.exception("Row failed (dataset_index=%s id=%s): %s", ds_idx, rid, exc)
+                        failed_obj = {
+                            "id": rid,
+                            "dataset_index": ds_idx,
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                            "timestamp_unix": int(time.time()),
+                        }
+                        await asyncio.to_thread(append_jsonl, failed_jsonl, failed_obj)
+
+                        if rid != "unknown":
+                            stem = checkpoint_stem_from_id(rid)
+                            ckpt_path = os.path.join(args.checkpoint_dir, f"{stem}.json")
+                            state = await asyncio.to_thread(read_json, ckpt_path) or {"id": rid, "dataset_index": ds_idx}
+                            state["status"] = "failed"
+                            state["last_error"] = str(exc)
+                            state["failed_at_unix"] = int(time.time())
+                            await asyncio.to_thread(write_json_atomic, ckpt_path, state)
+
+                        pbar_rows.update(1)
+                        completed += 1
+                        continue
+
+                    await result_queue.put(result)
+                    pbar_rows.update(1)
+                    completed += 1
+                    if (non_tty_progress and not show_pbar) and (
+                        completed == 1 or completed % log_every == 0 or completed == len(candidates)
+                    ):
+                        elapsed = time.time() - started_at
+                        rate = completed / elapsed if elapsed > 0 else 0.0
+                        eta_seconds = (len(candidates) - completed) / rate if rate > 0 else 0.0
+                        async with units_lock:
+                            units_done_now = completed_units
+                        logging.info(
+                            "Progress: %d/%d rows (%.1f%%), units=%d/%d, rate=%.2f row/s, elapsed=%s, eta=%s",
+                            completed,
+                            len(candidates),
+                            100.0 * completed / len(candidates),
+                            units_done_now,
+                            total_units,
+                            rate,
+                            format_seconds(elapsed),
+                            format_seconds(eta_seconds),
+                        )
 
             await result_queue.join()
             if write_errors:
@@ -665,7 +775,10 @@ async def run_async(args: argparse.Namespace) -> int:
                 writer.cancel()
                 await asyncio.gather(writer, return_exceptions=True)
 
-    logging.info("Done. Output: %s", out_jsonl)
+    if failed_rows:
+        logging.warning("Done with row failures: %d failed rows. See %s", failed_rows, failed_jsonl)
+    else:
+        logging.info("Done. Output: %s", out_jsonl)
     return 0
 
 
