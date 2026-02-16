@@ -282,14 +282,13 @@ def build_query_prompt(query_en: str, positive_fragments: List[str]) -> str:
     return (
         "Translate the query below into Polish so that it is semantically consistent and sounds natural. "
         "Also adapt the phrasing to the context using the relevant fragments.\n\n"
+        "Return JSON exactly in the following format:\n"
+        '{"query_pl": "..."}\n\n'
+        "INPUT DATA:\n"
         f"QUERY (EN): {query_en}\n\n"
         "Relevant context fragments (EN):\n"
-        f"{frags}\n\n"
-        "Return JSON exactly in the following format:\n"
-        '{"query_pl": "..."}'
+        f"{frags}"
     )
-
-
 def build_text_prompt(
     query_en: str,
     query_pl: str,
@@ -305,25 +304,24 @@ def build_text_prompt(
 
     return (
         "Your task: translate into Polish the data for ONE candidate document.\n\n"
-        f"QUERY (PL) — use this wording consistently: {query_pl}\n"
-        f"QUERY (EN) — for reference only: {query_en}\n\n"
-        f"DOCUMENT LABEL (labels): {int(doc_label)}  (1 = relevant, 0 = not relevant)\n\n"
         "The text is provided as a list of SPANS (in order). "
         "Do NOT merge and do NOT split spans. Translate each span separately.\n\n"
-        "SPANS (EN):\n"
-        f"{spans_joined}\n\n"
-        "THINK_PROCESS (EN) associated with this document:\n"
-        f"{think_process_en}\n\n"
         "Requirements:\n"
         "1) Return a 'translated_spans' list of the same length as the number of spans.\n"
         "2) Translate 'think_process' into Polish as 'translated_think_process'.\n"
         "   - If the text contains the quoted query (e.g. in quotes), replace it with the Polish query (exactly as above).\n"
         "   - Preserve indices like 'Sentence [1]' (do not change numbers or brackets).\n\n"
         "Return JSON exactly in the following format:\n"
-        '{"translated_spans": ["...", "..."], "translated_think_process": "..."}'
+        '{"translated_spans": ["...", "..."], "translated_think_process": "..."}\n\n'
+        "INPUT DATA:\n"
+        f"QUERY (PL) - use this wording consistently: {query_pl}\n"
+        f"QUERY (EN) - for reference only: {query_en}\n\n"
+        f"DOCUMENT LABEL (labels): {int(doc_label)}  (1 = relevant, 0 = not relevant)\n\n"
+        "SPANS (EN):\n"
+        f"{spans_joined}\n\n"
+        "THINK_PROCESS (EN) associated with this document:\n"
+        f"{think_process_en}"
     )
-
-
 def build_text_prompt_strict(
     query_en: str,
     query_pl: str,
@@ -339,23 +337,23 @@ def build_text_prompt_strict(
     spans_joined = "\n\n".join(spans_block) if spans_block else "(no spans)"
 
     return (
-        "EN→PL TRANSLATION. This is a structural task.\n"
+        "EN->PL TRANSLATION. This is a structural task.\n"
         "You must return ONLY valid JSON.\n"
-        f"KEY CONSTRAINT: the number of elements in 'translated_spans' MUST be exactly {n}.\n"
+        "KEY CONSTRAINT: the number of elements in 'translated_spans' MUST be exactly N (provided in INPUT DATA).\n"
         "You must not remove, merge, or split spans. One EN span -> one PL span.\n\n"
+        "Return JSON exactly in the following format:\n"
+        '{"translated_spans": ["SPAN1_PL", "SPAN2_PL", "..."], "translated_think_process": "..."}\n\n'
+        "Note: if you want to use a newline inside a JSON string, use the \\n escape sequence (do not insert a raw newline).\n\n"
+        "INPUT DATA:\n"
+        f"N_SPANS: {n}\n"
         f"QUERY (PL): {query_pl}\n"
         f"QUERY (EN): {query_en}\n"
         f"DOCUMENT LABEL: {int(doc_label)}\n\n"
         "SPANS (EN) (numbered):\n"
         f"{spans_joined}\n\n"
         "THINK_PROCESS (EN):\n"
-        f"{think_process_en}\n\n"
-        "Return JSON exactly in the following format:\n"
-        '{"translated_spans": ["SPAN1_PL", "SPAN2_PL", "..."], "translated_think_process": "..."}\n\n'
-        "Note: if you want to use a newline inside a JSON string, use the \\n escape sequence (do not insert a raw newline)."
+        f"{think_process_en}"
     )
-
-
 def build_text_prompt_dictforced(
     query_en: str,
     query_pl: str,
@@ -371,26 +369,26 @@ def build_text_prompt_dictforced(
     spans_joined = "\n\n".join(spans_block) if spans_block else "(no spans)"
 
     return (
-        "EN→PL TRANSLATION. You must return ONLY valid JSON.\n"
-        f"You must return exactly {n} spans.\n"
+        "EN->PL TRANSLATION. You must return ONLY valid JSON.\n"
+        "You must return exactly N spans (provided in INPUT DATA).\n"
         "Return them as a 'translated_spans_dict' object with string keys from \"1\" to \"N\".\n"
         "You MUST NOT skip any number.\n\n"
+        "Return JSON exactly in the following format:\n"
+        "{"
+        '"translated_spans_dict": {"1": "...", "2": "...", "3": "..."}'
+        ', "translated_think_process": "..."'
+        "}\n\n"
+        "Note: use \\n in JSON strings instead of raw newlines.\n\n"
+        "INPUT DATA:\n"
+        f"N_SPANS: {n}\n"
         f"QUERY (PL): {query_pl}\n"
         f"QUERY (EN): {query_en}\n"
         f"DOCUMENT LABEL: {int(doc_label)}\n\n"
         "SPANS (EN):\n"
         f"{spans_joined}\n\n"
         "THINK_PROCESS (EN):\n"
-        f"{think_process_en}\n\n"
-        "Return JSON exactly in the following format:\n"
-        "{"
-        '"translated_spans_dict": {"1": "...", "2": "...", "3": "..."}'
-        ', "translated_think_process": "..."'
-        "}\n\n"
-        "Note: use \\n in JSON strings instead of raw newlines."
+        f"{think_process_en}"
     )
-
-
 # ---------------------------
 # LLM call wrapper (key/model aware)
 # ---------------------------
@@ -930,3 +928,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nInterrupted (CTRL+C).", file=sys.stderr)
         raise SystemExit(130)
+
