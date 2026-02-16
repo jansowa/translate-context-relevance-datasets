@@ -2,33 +2,36 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import asyncio
 import logging
 import os
-import queue
+import openai
 import random
 import sys
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from datasets import load_dataset
-from openai import OpenAI
+from openai import AsyncOpenAI
 from tqdm import tqdm
 
 from translate_context_relevance_dataset import (
     SYSTEM_QUERY,
+    SYSTEM_TEXT,
     RateLimitReached,
     append_jsonl,
+    build_text_prompt,
+    build_text_prompt_dictforced,
+    build_text_prompt_strict,
     build_query_prompt,
     checkpoint_stem_from_id,
-    llm_call_json,
+    escape_control_chars_in_json_strings,
+    extract_first_json_object,
     load_done_ids_from_jsonl,
     read_json,
     rebuild_text_and_spans,
     spans_to_pieces,
-    translate_text_with_span_repair,
     write_json_atomic,
 )
 
@@ -64,6 +67,20 @@ class RowResult:
     rid: str
     ckpt_path: str
     out_row: Dict[str, Any]
+
+
+def _is_rate_limited(exc: BaseException) -> bool:
+    if isinstance(exc, openai.RateLimitError):
+        return True
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 429:
+        return True
+    msg = str(exc).lower()
+    if "429" in msg and ("rate" in msg or "limit" in msg or "quota" in msg):
+        return True
+    if "rate limit" in msg or "quota" in msg:
+        return True
+    return False
 
 
 def checkpoint_is_complete(state: Dict[str, Any], expected_texts: int) -> bool:
@@ -116,20 +133,141 @@ def build_out_row_from_state(
     return out_row
 
 
-def process_row(
+async def llm_call_json_async(
+    client: AsyncOpenAI,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float,
+    max_retries: int,
+    delay_seconds: float,
+) -> Dict[str, Any]:
+    last_err: Optional[BaseException] = None
+
+    for attempt in range(max_retries):
+        try:
+            kwargs = dict(
+                model=model,
+                temperature=temperature,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+
+            try:
+                kwargs["response_format"] = {"type": "json_object"}
+            except Exception:
+                pass
+
+            resp = await client.chat.completions.create(**kwargs)
+            content = resp.choices[0].message.content or ""
+
+            try:
+                obj = extract_first_json_object(content)
+            except Exception:
+                fixed = escape_control_chars_in_json_strings(content)
+                obj = extract_first_json_object(fixed)
+
+            if delay_seconds and delay_seconds > 0:
+                await asyncio.sleep(float(delay_seconds))
+
+            return obj
+
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            if _is_rate_limited(e):
+                raise RateLimitReached(str(e)) from e
+            await asyncio.sleep(min(60, (2 ** attempt) + random.random()))
+
+    raise RuntimeError(f"LLM call failed after retries: {last_err}") from last_err
+
+
+async def translate_text_with_span_repair_async(
+    client: AsyncOpenAI,
+    model: str,
+    query_en: str,
+    query_pl: str,
+    doc_label: int,
+    span_texts_en: List[str],
+    spans_rel_i: List[int],
+    think_process_en: str,
+    *,
+    delay_seconds: float,
+    temperature: float,
+    max_retries: int,
+    max_attempts: int = 3,
+) -> Tuple[List[str], str]:
+    n = len(span_texts_en)
+
+    prompts = [
+        build_text_prompt(query_en, query_pl, doc_label, span_texts_en, spans_rel_i, think_process_en),
+        build_text_prompt_strict(query_en, query_pl, doc_label, span_texts_en, spans_rel_i, think_process_en),
+        build_text_prompt_dictforced(query_en, query_pl, doc_label, span_texts_en, spans_rel_i, think_process_en),
+    ][:max_attempts]
+
+    last_problem = None
+    for attempt_idx, prompt in enumerate(prompts, start=1):
+        t_json = await llm_call_json_async(
+            client=client,
+            model=model,
+            system_prompt=SYSTEM_TEXT,
+            user_prompt=prompt,
+            temperature=temperature,
+            max_retries=max_retries,
+            delay_seconds=delay_seconds,
+        )
+
+        if "translated_spans" in t_json:
+            translated_spans = t_json.get("translated_spans")
+            translated_tp = t_json.get("translated_think_process")
+            if isinstance(translated_spans, list) and len(translated_spans) == n and isinstance(translated_tp, str):
+                translated_spans = [str(s).replace("\r\n", "\n") for s in translated_spans]
+                translated_tp = translated_tp.replace("\r\n", "\n")
+                return translated_spans, translated_tp
+
+            last_problem = (
+                f"attempt {attempt_idx}: expected {n} spans, "
+                f"got {type(translated_spans)} len={len(translated_spans) if isinstance(translated_spans, list) else 'N/A'}"
+            )
+
+        if "translated_spans_dict" in t_json:
+            d = t_json.get("translated_spans_dict")
+            translated_tp = t_json.get("translated_think_process")
+            if isinstance(d, dict) and isinstance(translated_tp, str):
+                ok = True
+                out = []
+                for k in range(1, n + 1):
+                    ks = str(k)
+                    if ks not in d:
+                        ok = False
+                        break
+                    out.append(str(d[ks]))
+                if ok:
+                    out = [s.replace("\r\n", "\n") for s in out]
+                    translated_tp = translated_tp.replace("\r\n", "\n")
+                    return out, translated_tp
+
+            last_problem = f"attempt {attempt_idx}: translated_spans_dict missing keys 1..{n} or bad types"
+
+    raise RuntimeError(
+        f"Failed to obtain the correct number of spans after {len(prompts)} attempts. Last issue: {last_problem}"
+    )
+
+
+async def process_row(
     row: Dict[str, Any],
     ds_idx: int,
     args: argparse.Namespace,
     api_key_last6: str,
+    client: AsyncOpenAI,
     unit_done_callback: Optional[Callable[[int], None]] = None,
 ) -> RowResult:
-    client = OpenAI(api_key=args.api_key, base_url=args.base_url)
-
     rid = row["id"]
     stem = checkpoint_stem_from_id(rid)
     ckpt_path = os.path.join(args.checkpoint_dir, f"{stem}.json")
 
-    state = read_json(ckpt_path) or {}
+    state = await asyncio.to_thread(read_json, ckpt_path) or {}
     if not state:
         state = {
             "id": rid,
@@ -144,7 +282,7 @@ def process_row(
             "active_key_last6": None,
             "dataset_index": ds_idx,
         }
-        write_json_atomic(ckpt_path, state)
+        await asyncio.to_thread(write_json_atomic, ckpt_path, state)
 
     query_en = row["query"]
     texts: List[str] = row["texts"]
@@ -169,7 +307,7 @@ def process_row(
             rel_frags = pos_span_texts[:3]
 
         q_prompt = build_query_prompt(query_en, rel_frags)
-        q_json = llm_call_json(
+        q_json = await llm_call_json_async(
             client=client,
             model=args.model,
             system_prompt=SYSTEM_QUERY,
@@ -184,7 +322,7 @@ def process_row(
 
         state["active_model"] = args.model
         state["active_key_last6"] = api_key_last6
-        write_json_atomic(ckpt_path, state)
+        await asyncio.to_thread(write_json_atomic, ckpt_path, state)
         if unit_done_callback:
             unit_done_callback(1)
 
@@ -207,7 +345,7 @@ def process_row(
             spans_rel_i = spans_rel_i[:m]
             gaps = gaps[: m + 1]
 
-        translated_spans, translated_tp = translate_text_with_span_repair(
+        translated_spans, translated_tp = await translate_text_with_span_repair_async(
             client=client,
             model=args.model,
             query_en=query_en,
@@ -230,7 +368,7 @@ def process_row(
         state["done_text_idxs"].append(i)
         state["active_model"] = args.model
         state["active_key_last6"] = api_key_last6
-        write_json_atomic(ckpt_path, state)
+        await asyncio.to_thread(write_json_atomic, ckpt_path, state)
         if unit_done_callback:
             unit_done_callback(1)
 
@@ -260,29 +398,28 @@ def process_row(
     return RowResult(rid=rid, ckpt_path=ckpt_path, out_row=out_row)
 
 
-def writer_loop(
-    q: "queue.Queue[Optional[RowResult]]",
+async def writer_loop(
+    q: "asyncio.Queue[Optional[RowResult]]",
     out_jsonl: str,
     done_ids: set,
-    done_lock: threading.Lock,
     write_errors: List[BaseException],
 ) -> None:
     try:
         while True:
-            item = q.get()
-            if item is None:
-                q.task_done()
-                return
+            item = await q.get()
+            try:
+                if item is None:
+                    return
 
-            if item.rid not in done_ids:
-                append_jsonl(out_jsonl, item.out_row)
-                with done_lock:
+                if item.rid not in done_ids:
+                    await asyncio.to_thread(append_jsonl, out_jsonl, item.out_row)
                     done_ids.add(item.rid)
 
-            state = read_json(item.ckpt_path) or {"id": item.rid}
-            state["status"] = "done"
-            write_json_atomic(item.ckpt_path, state)
-            q.task_done()
+                state = await asyncio.to_thread(read_json, item.ckpt_path) or {"id": item.rid}
+                state["status"] = "done"
+                await asyncio.to_thread(write_json_atomic, item.ckpt_path, state)
+            finally:
+                q.task_done()
     except BaseException as exc:  # noqa: BLE001
         logging.exception("Writer loop failed")
         write_errors.append(exc)
@@ -327,16 +464,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
-    )
-    quiet_external_loggers()
-
+async def run_async(args: argparse.Namespace) -> int:
     if args.checkpoint_dir is None:
         args.checkpoint_dir = os.path.join(args.out_dir, "checkpoints")
 
@@ -345,7 +473,6 @@ def main() -> int:
 
     out_jsonl = os.path.join(args.out_dir, args.out_jsonl_name)
     done_ids = load_done_ids_from_jsonl(out_jsonl)
-    done_lock = threading.Lock()
 
     ds = load_dataset(args.dataset, split=args.split)
     total = len(ds)
@@ -371,7 +498,6 @@ def main() -> int:
         ckpt_path = os.path.join(args.checkpoint_dir, f"{stem}.json")
         state = read_json(ckpt_path) or {}
 
-        # If checkpoint already contains a full row, flush it to JSONL and mark as done.
         if state and checkpoint_is_complete(state, expected_texts=len(row["texts"])):
             append_jsonl(out_jsonl, build_out_row_from_state(state, row, ds_idx, args))
             done_ids.add(rid)
@@ -385,7 +511,6 @@ def main() -> int:
         else:
             candidates_fresh.append((ds_idx, row))
 
-    # Prefer closing already-started rows before opening new checkpoints.
     candidates = candidates_with_ckpt + candidates_fresh
 
     if not candidates:
@@ -409,16 +534,15 @@ def main() -> int:
     )
 
     api_key_last6 = args.api_key[-6:] if args.api_key else "EMPTY"
-    result_queue: "queue.Queue[Optional[RowResult]]" = queue.Queue(maxsize=max(4, args.parallel_requests * 2))
+    result_queue: "asyncio.Queue[Optional[RowResult]]" = asyncio.Queue(
+        maxsize=max(4, args.parallel_requests * 2)
+    )
     write_errors: List[BaseException] = []
 
-    writer = threading.Thread(
-        target=writer_loop,
-        args=(result_queue, out_jsonl, done_ids, done_lock, write_errors),
-        daemon=True,
+    writer = asyncio.create_task(
+        writer_loop(result_queue, out_jsonl, done_ids, write_errors)
     )
-    writer.start()
-    logging.info("Writer thread started. Output: %s", out_jsonl)
+    logging.info("Writer task started. Output: %s", out_jsonl)
 
     total_units = 0
     done_units_before = 0
@@ -473,33 +597,34 @@ def main() -> int:
     completed = 0
     log_every = max(1, int(args.log_every))
     completed_units = done_units_before
-    units_lock = threading.Lock()
+    units_lock = asyncio.Lock()
 
     def mark_units_done(increment: int) -> None:
         nonlocal completed_units
         if increment <= 0:
             return
-        with units_lock:
-            completed_units += increment
-            pbar_units.update(increment)
+        completed_units += increment
+        pbar_units.update(increment)
 
-    try:
-        with ThreadPoolExecutor(max_workers=max(1, args.parallel_requests)) as executor:
-            futures = [
-                executor.submit(process_row, row, ds_idx, args, api_key_last6, mark_units_done)
-                for ds_idx, row in candidates
-            ]
+    sem = asyncio.Semaphore(max(1, args.parallel_requests))
 
-            for fut in as_completed(futures):
+    async with AsyncOpenAI(api_key=args.api_key, base_url=args.base_url) as client:
+        async def process_with_limit(ds_idx: int, row: Dict[str, Any]) -> RowResult:
+            async with sem:
+                return await process_row(row, ds_idx, args, api_key_last6, client, mark_units_done)
+
+        tasks = [asyncio.create_task(process_with_limit(ds_idx, row)) for ds_idx, row in candidates]
+        try:
+            for fut in asyncio.as_completed(tasks):
                 if write_errors:
-                    raise RuntimeError(f"Writer thread failed: {write_errors[0]}") from write_errors[0]
+                    raise RuntimeError(f"Writer task failed: {write_errors[0]}") from write_errors[0]
                 try:
-                    result = fut.result()
+                    result = await fut
                 except RateLimitReached:
-                    time.sleep(1 + random.random())
+                    await asyncio.sleep(1 + random.random())
                     raise
 
-                result_queue.put(result)
+                await result_queue.put(result)
                 pbar_rows.update(1)
                 completed += 1
                 if (non_tty_progress and not show_pbar) and (
@@ -508,7 +633,7 @@ def main() -> int:
                     elapsed = time.time() - started_at
                     rate = completed / elapsed if elapsed > 0 else 0.0
                     eta_seconds = (len(candidates) - completed) / rate if rate > 0 else 0.0
-                    with units_lock:
+                    async with units_lock:
                         units_done_now = completed_units
                     logging.info(
                         "Progress: %d/%d rows (%.1f%%), units=%d/%d, rate=%.2f row/s, elapsed=%s, eta=%s",
@@ -522,17 +647,38 @@ def main() -> int:
                         format_seconds(eta_seconds),
                     )
 
-        result_queue.join()
-        if write_errors:
-            raise RuntimeError(f"Writer thread failed: {write_errors[0]}") from write_errors[0]
-    finally:
-        pbar_rows.close()
-        pbar_units.close()
-        result_queue.put(None)
-        writer.join(timeout=10)
+            await result_queue.join()
+            if write_errors:
+                raise RuntimeError(f"Writer task failed: {write_errors[0]}") from write_errors[0]
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            pbar_rows.close()
+            pbar_units.close()
+            await result_queue.put(None)
+            try:
+                await asyncio.wait_for(writer, timeout=10)
+            except asyncio.TimeoutError:
+                writer.cancel()
+                await asyncio.gather(writer, return_exceptions=True)
 
     logging.info("Done. Output: %s", out_jsonl)
     return 0
+
+
+def main() -> int:
+    args = parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
+    quiet_external_loggers()
+    return asyncio.run(run_async(args))
 
 
 if __name__ == "__main__":
