@@ -16,7 +16,7 @@ from datasets import load_dataset
 from openai import AsyncOpenAI
 from tqdm import tqdm
 
-from translate_context_relevance_dataset import (
+from translation_core import (
     SYSTEM_QUERY,
     SYSTEM_TEXT,
     RateLimitReached,
@@ -514,7 +514,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint-dir", default=None)
     p.add_argument("--max-rows", type=int, default=0, help="0 = all")
     p.add_argument("--skip-rows", type=int, default=0)
-    p.add_argument("--keep-original-columns", default=True, action="store_true")
+    p.add_argument(
+        "--keep-original-columns",
+        dest="keep_original_columns",
+        action="store_true",
+        default=True,
+        help="Keep original EN columns in the output JSONL (default).",
+    )
+    p.add_argument(
+        "--drop-original-columns",
+        dest="keep_original_columns",
+        action="store_false",
+        help="Exclude original EN columns from output JSONL.",
+    )
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     p.add_argument("--log-every", type=int, default=10, help="Log progress every N completed rows in non-TTY mode")
     p.add_argument(
