@@ -889,7 +889,19 @@ def main() -> int:
     p.add_argument("--out-jsonl-name", default="translated.jsonl")
     p.add_argument("--checkpoint-dir", default=None, help="Default: <out-dir>/checkpoints")
     p.add_argument("--max-rows", type=int, default=0, help="0 = all")
-    p.add_argument("--keep-original-columns", default=True, action="store_true", help="Keep original EN columns in the JSONL.")
+    p.add_argument(
+        "--keep-original-columns",
+        dest="keep_original_columns",
+        action="store_true",
+        default=True,
+        help="Keep original EN columns in the JSONL (default).",
+    )
+    p.add_argument(
+        "--drop-original-columns",
+        dest="keep_original_columns",
+        action="store_false",
+        help="Exclude original EN columns from the JSONL output.",
+    )
     p.add_argument("--max-prompt-attempts", type=int, default=4, help="How many increasingly strict prompts to try for spans.")
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     p.add_argument("--log-every", type=int, default=10, help="Log progress every N completed rows in non-TTY mode")

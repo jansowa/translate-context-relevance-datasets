@@ -21,7 +21,7 @@ cp .env.example .env
 Key variables in `.env`:
 
 - `MODEL_NAME` - model name served by vLLM
-- `PARALLEL_REQUESTS` - number of parallel requests on the translator side (`ThreadPoolExecutor`)
+- `PARALLEL_REQUESTS` - number of parallel translation tasks on the translator side (`asyncio` + semaphore)
 - `PROGRESS_BAR` - translation progress display mode: `on` (default), `auto` (TTY only), `off`
 - `PROGRESS_METRIC` - progress metric for `tqdm`: `checkpoints` (default), `rows`, `both`
 - `GPU_COUNT` - number of GPUs used by vLLM (`--tensor-parallel-size`)
@@ -34,7 +34,7 @@ Available profiles:
 
 - `.env.example` - lightweight profile (defaults to `Qwen/Qwen2.5-0.5B-Instruct`, `PARALLEL_REQUESTS=2`, `GPU_COUNT=1`)
 - `.env.gptoss` - multi-GPU profile (`openai/gpt-oss-120b`, `PARALLEL_REQUESTS=16`, `GPU_COUNT=4`)
-- `.env.bielikq4` - Bielik 11B in 4-bit AWQ quantization with 16 GB-friendly tuning (`speakleash/Bielik-11B-v3.0-Instruct-awq`, `VLLM_QUANTIZATION=awq`, `PARALLEL_REQUESTS=1`)
+- `.env.bielikq4` - Bielik 11B AWQ profile with 16 GB-oriented tuning (`speakleash/Bielik-11B-v3.0-Instruct-awq`, `VLLM_QUANTIZATION=`, `PARALLEL_REQUESTS=4`)
 
 ## Running
 
@@ -97,8 +97,8 @@ Runtime behavior:
   - reads dataset rows,
   - translates queries and documents,
   - preserves output/checkpoint format compatible with the existing workflow,
-  - sends requests in parallel via `ThreadPoolExecutor`,
-  - serializes disk writes through a dedicated writer thread (queue) to reduce worker blocking.
+  - runs row processing concurrently via `asyncio` tasks (bounded by a semaphore),
+  - serializes disk writes through a dedicated writer task (queue) to reduce worker blocking.
 
 ## Dependencies (uv + requirements)
 
@@ -111,10 +111,20 @@ Update pinned dependencies:
 uv pip compile requirements.in -o requirements.txt
 ```
 
+## Development
+
+Run unit tests:
+
+```bash
+pytest -q
+```
+
+CI runs tests automatically on push and pull requests.
+
 ## Original script
 
 The repository still includes the original script:
 
 - `translate_context_relevance_dataset.py`
 
-It was not removed or modified.
+It is kept as a legacy/compatibility runner alongside `run_translation_vllm.py`.

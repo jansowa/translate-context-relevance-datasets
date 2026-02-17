@@ -1,5 +1,11 @@
 .env
+.env.*
+!.env.example
+!.env.bielikq4
+!.env.gptoss
 __pycache__/
+.pytest_cache/
 *.pyc
 out_pl/
-.idea
+out_pl_backup/
+.idea/
