@@ -9,6 +9,7 @@ import openai
 import random
 import sys
 import time
+import copy
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -33,6 +34,21 @@ from translation_core import (
     rebuild_text_and_spans,
     spans_to_pieces,
     write_json_atomic,
+)
+
+DATASET_PRESETS: dict[str, str] = {
+    "nq": "zilliz/natural_questions-context-relevance-with-think",
+    "msmarco": "zilliz/msmarco-context-relevance-with-think",
+}
+
+REQUIRED_DATASET_COLUMNS = (
+    "id",
+    "query",
+    "texts",
+    "context_spans",
+    "context_spans_relevance",
+    "labels",
+    "think_process",
 )
 
 
@@ -110,6 +126,8 @@ def build_out_row_from_state(
 ) -> dict[str, Any]:
     out_row = {
         "id": row["id"],
+        "source_dataset": args.dataset_key,
+        "source_dataset_hf": args.dataset,
         "query": state["query_pl"],
         "texts": state["texts_pl"],
         "context_spans": state["context_spans_pl"],
@@ -436,6 +454,8 @@ async def process_row(
 
     out_row = {
         "id": rid,
+        "source_dataset": args.dataset_key,
+        "source_dataset_hf": args.dataset,
         "query": state["query_pl"],
         "texts": state["texts_pl"],
         "context_spans": state["context_spans_pl"],
@@ -506,7 +526,12 @@ def parse_args() -> argparse.Namespace:
         help="Stop whole run on first row-level translation error.",
     )
 
-    p.add_argument("--dataset", default="zilliz/natural_questions-context-relevance-with-think")
+    p.add_argument(
+        "--datasets",
+        default="all",
+        choices=["all", "nq", "msmarco"],
+        help="Dataset selection: all=run NQ then MS MARCO, or a single dataset key.",
+    )
     p.add_argument("--split", default="train", choices=["train", "validation", "test"])
     p.add_argument("--out-dir", default="out_pl")
     p.add_argument("--out-jsonl-name", default="translated.jsonl")
@@ -544,7 +569,16 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-async def run_async(args: argparse.Namespace) -> int:
+def validate_dataset_schema(ds: Any, dataset_label: str) -> None:
+    cols = set(getattr(ds, "column_names", []) or [])
+    missing = [c for c in REQUIRED_DATASET_COLUMNS if c not in cols]
+    if missing:
+        raise RuntimeError(
+            f"Dataset '{dataset_label}' is missing required columns: {missing}. Available columns: {sorted(cols)}"
+        )
+
+
+async def run_single_dataset_async(args: argparse.Namespace) -> int:
     if args.checkpoint_dir is None:
         args.checkpoint_dir = os.path.join(args.out_dir, "checkpoints")
 
@@ -556,6 +590,7 @@ async def run_async(args: argparse.Namespace) -> int:
     done_ids = load_done_ids_from_jsonl(out_jsonl)
 
     ds = load_dataset(args.dataset, split=args.split)
+    validate_dataset_schema(ds, args.dataset)
     total = len(ds)
 
     skip = max(0, int(args.skip_rows))
@@ -599,7 +634,8 @@ async def run_async(args: argparse.Namespace) -> int:
         return 0
 
     logging.info(
-        "Translation run: dataset=%s split=%s model=%s parallel=%d range=%d..%d total_in_range=%d pending=%d done_before=%d recovered_from_checkpoints=%d pending_with_checkpoints=%d pending_new=%d",
+        "Translation run: dataset_key=%s dataset=%s split=%s model=%s parallel=%d range=%d..%d total_in_range=%d pending=%d done_before=%d recovered_from_checkpoints=%d pending_with_checkpoints=%d pending_new=%d",
+        args.dataset_key,
         args.dataset,
         args.split,
         args.model,
@@ -726,6 +762,8 @@ async def run_async(args: argparse.Namespace) -> int:
                         logging.exception("Row failed (dataset_index=%s id=%s): %s", ds_idx, rid, exc)
                         failed_obj = {
                             "id": rid,
+                            "source_dataset": args.dataset_key,
+                            "source_dataset_hf": args.dataset,
                             "dataset_index": ds_idx,
                             "error": str(exc),
                             "error_type": type(exc).__name__,
@@ -791,6 +829,35 @@ async def run_async(args: argparse.Namespace) -> int:
         logging.warning("Done with row failures: %d failed rows. See %s", failed_rows, failed_jsonl)
     else:
         logging.info("Done. Output: %s", out_jsonl)
+    return 0
+
+
+async def run_async(args: argparse.Namespace) -> int:
+    selected_keys = ["nq", "msmarco"] if args.datasets == "all" else [args.datasets]
+    runs: list[tuple[str, str]] = [(k, DATASET_PRESETS[k]) for k in selected_keys]
+
+    logging.info(
+        "Selected dataset runs: %s",
+        ", ".join([f"{k} -> {hf}" for k, hf in runs]),
+    )
+
+    for dataset_key, dataset_hf_id in runs:
+        run_args = copy.deepcopy(args)
+        run_args.dataset_key = dataset_key
+        run_args.dataset = dataset_hf_id
+        run_args.out_dir = os.path.join(args.out_dir, dataset_key)
+        run_args.checkpoint_dir = None
+        logging.info(
+            "Starting dataset run: key=%s hf_id=%s out_dir=%s split=%s",
+            dataset_key,
+            dataset_hf_id,
+            run_args.out_dir,
+            run_args.split,
+        )
+        rc = await run_single_dataset_async(run_args)
+        if rc != 0:
+            return rc
+
     return 0
 
 

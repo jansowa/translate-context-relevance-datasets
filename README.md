@@ -1,6 +1,9 @@
 # Translate context relevance dataset (EN -> PL)
 
-This repository provides a tool for translating the HuggingFace dataset `zilliz/natural_questions-context-relevance-with-think` from English to Polish.
+This repository provides a tool for translating context-relevance HuggingFace datasets from English to Polish.
+Currently supported:
+- `zilliz/natural_questions-context-relevance-with-think` (`nq`)
+- `zilliz/msmarco-context-relevance-with-think` (`msmarco`)
 
 The pipeline runs locally using **vLLM (OpenAI-compatible API)** and a separate **translator** container.
 Results are written to JSONL, and progress is persisted with checkpoints so the process can be safely resumed.
@@ -50,6 +53,14 @@ docker compose up -d --build vllm
 docker compose run --rm translator
 ```
 
+By default, the translator runs both datasets sequentially (`nq` then `msmarco`).
+Use `--datasets` to limit the run:
+
+```bash
+docker compose run --rm translator --datasets nq
+docker compose run --rm translator --datasets msmarco
+```
+
 ## First test on a small GPU (e.g. 8 GB VRAM)
 
 Recommended quick end-to-end test:
@@ -71,11 +82,10 @@ If you hit GPU OOM:
 
 ## Output and checkpoints
 
-Output files are written inside the repository directory:
+Output files are written inside the repository directory, in separate subfolders per dataset:
 
-- `out_pl/translated.jsonl` - final output (1 record per line)
-- `out_pl/failed_rows.jsonl` - rows that failed translation validation/runtime (appended)
-- `out_pl/checkpoints/*.json` - per-`id` checkpoints
+- `out_pl/nq/translated.jsonl`, `out_pl/nq/failed_rows.jsonl`, `out_pl/nq/checkpoints/*.json`
+- `out_pl/msmarco/translated.jsonl`, `out_pl/msmarco/failed_rows.jsonl`, `out_pl/msmarco/checkpoints/*.json`
 
 You can resume processing by running the translator again with the same parameters.
 Already completed records are skipped.
@@ -84,7 +94,7 @@ For correct interactive `tqdm` rendering, run the translator with `docker compos
 Runtime behavior:
 
 - the translator uses structured output (`response_format=json_schema` when supported, with fallback to `json_object`) to enforce translation shape
-- row-level failures do not stop the whole run by default; they are logged to `out_pl/failed_rows.jsonl`
+- row-level failures do not stop the whole run by default; they are logged to `<out-dir>/<dataset_key>/failed_rows.jsonl`
 - use `--fail-fast` to stop the entire run on the first failed row
 - use `--failed-jsonl-name <name>` to change the failed-rows file name
 

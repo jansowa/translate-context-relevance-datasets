@@ -56,7 +56,4 @@ services:
     volumes:
       - ./:/app
     working_dir: /app
-    command: >
-      python run_translation_vllm.py
-      --model ${MODEL_NAME}
-      --parallel-requests ${PARALLEL_REQUESTS}
+    entrypoint: ["python", "run_translation_vllm.py"]
