@@ -878,7 +878,7 @@ def main() -> int:
     p.add_argument("--base-url", default=None, help="Base URL for an OpenAI-compatible API (optional).")
     p.add_argument("--delay-seconds", type=float, default=2.0, help="Delay after each SUCCESSFUL request.")
     p.add_argument("--temperature", type=float, default=0.0, help="LLM temperature.")
-    p.add_argument("--max-retries", type=int, default=6, help="Retries for errors other than 429.")
+    p.add_argument("--max-retries", type=int, default=2, help="Retries for errors other than 429.")
     p.add_argument("--api-keys", required=True, help="Key list, e.g. 'k1,k2,k3'.")
     p.add_argument("--models", required=True, help="Model list, e.g. 'm1,m2'.")
 

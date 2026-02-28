@@ -19,11 +19,14 @@ from tqdm import tqdm
 
 from translation_core import (
     SYSTEM_QUERY,
+    SYSTEM_TEXT_SIMPLE,
     SYSTEM_TEXT,
     TOXIC_LABEL_DESCRIPTIONS,
+    WILDGUARD_SUBCATEGORY_DESCRIPTIONS,
     RateLimitReached,
     append_jsonl,
     build_toxic_comment_prompt,
+    build_wildguard_prompt,
     build_text_prompt,
     build_text_prompt_dictforced,
     build_text_prompt_strict,
@@ -34,6 +37,7 @@ from translation_core import (
     load_done_ids_from_jsonl,
     read_json,
     rebuild_text_and_spans,
+    normalize_wildguard_subcategories,
     spans_to_pieces,
     write_json_atomic,
 )
@@ -42,6 +46,7 @@ DATASET_PRESETS: dict[str, str] = {
     "nq": "zilliz/natural_questions-context-relevance-with-think",
     "msmarco": "zilliz/msmarco-context-relevance-with-think",
     "toxic": "thesofakillers/jigsaw-toxic-comment-classification-challenge",
+    "wildguard": "allenai/wildguardmix",
 }
 
 REQUIRED_CONTEXT_RELEVANCE_COLUMNS = (
@@ -60,6 +65,14 @@ REQUIRED_TOXIC_COLUMNS = (
     "id",
     "comment_text",
     *TOXIC_LABEL_COLUMNS,
+)
+
+WILDGUARD_SUBCATEGORY_COLUMNS = tuple(WILDGUARD_SUBCATEGORY_DESCRIPTIONS.keys())
+
+REQUIRED_WILDGUARD_COLUMNS = (
+    "id",
+    "prompt",
+    "subcategories",
 )
 
 
@@ -133,6 +146,10 @@ def checkpoint_is_complete_toxic(state: dict[str, Any]) -> bool:
     return bool(state.get("comment_text_pl"))
 
 
+def checkpoint_is_complete_wildguard(state: dict[str, Any]) -> bool:
+    return bool(state.get("prompt_pl"))
+
+
 def active_toxic_types_from_row(row: dict[str, Any]) -> list[str]:
     active = []
     for label in TOXIC_LABEL_COLUMNS:
@@ -193,6 +210,28 @@ def build_out_row_from_state_toxic(
     }
     for label in TOXIC_LABEL_COLUMNS:
         out_row[label] = int(row[label])
+    return out_row
+
+
+def build_out_row_from_state_wildguard(
+    state: dict[str, Any],
+    row: dict[str, Any],
+    ds_idx: int,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    out_row = dict(row)
+    out_row.update(
+        {
+            "id": row["id"],
+            "source_dataset": args.dataset_key,
+            "source_dataset_hf": args.dataset,
+            "prompt_pl": state["prompt_pl"],
+            "translation_model": state.get("active_model"),
+            "translation_key_last6": state.get("active_key_last6"),
+            "translation_base_url": (args.base_url or None),
+            "dataset_index": ds_idx,
+        }
+    )
     return out_row
 
 
@@ -567,7 +606,7 @@ async def process_row_toxic(
         translated_obj = await llm_call_json_async(
             client=client,
             model=args.model,
-            system_prompt=SYSTEM_TEXT,
+            system_prompt=SYSTEM_TEXT_SIMPLE,
             user_prompt=prompt,
             temperature=args.temperature,
             max_retries=args.max_retries,
@@ -584,6 +623,68 @@ async def process_row_toxic(
             unit_done_callback(1)
 
     out_row = build_out_row_from_state_toxic(state, row, ds_idx, args)
+    return RowResult(rid=rid, ckpt_path=ckpt_path, out_row=out_row)
+
+
+async def process_row_wildguard(
+    row: dict[str, Any],
+    ds_idx: int,
+    args: argparse.Namespace,
+    api_key_last6: str,
+    client: AsyncOpenAI,
+    unit_done_callback: Callable[[int], None] | None = None,
+) -> RowResult:
+    rid = row["id"]
+    stem = checkpoint_stem_from_id(rid)
+    ckpt_path = os.path.join(args.checkpoint_dir, f"{stem}.json")
+
+    subcategories = normalize_wildguard_subcategories(row.get("subcategories"))
+
+    state = await asyncio.to_thread(read_json, ckpt_path) or {}
+    if not state:
+        state = {
+            "id": rid,
+            "prompt_en": row["prompt"],
+            "prompt_pl": None,
+            "subcategories": subcategories,
+            "status": "in_progress",
+            "active_model": None,
+            "active_key_last6": None,
+            "dataset_index": ds_idx,
+        }
+        await asyncio.to_thread(write_json_atomic, ckpt_path, state)
+
+    if not state.get("prompt_pl"):
+        prompt = build_wildguard_prompt(
+            prompt_en=row["prompt"],
+            subcategories=subcategories,
+        )
+        schema = {
+            "type": "object",
+            "properties": {"prompt_pl": {"type": "string"}},
+            "required": ["prompt_pl"],
+            "additionalProperties": False,
+        }
+        translated_obj = await llm_call_json_async(
+            client=client,
+            model=args.model,
+            system_prompt=SYSTEM_TEXT_SIMPLE,
+            user_prompt=prompt,
+            temperature=args.temperature,
+            max_retries=args.max_retries,
+            delay_seconds=args.delay_seconds,
+            response_schema=schema,
+        )
+        state["prompt_pl"] = (translated_obj.get("prompt_pl") or "").strip()
+        if not state["prompt_pl"]:
+            raise RuntimeError("Empty prompt_pl from model")
+        state["active_model"] = args.model
+        state["active_key_last6"] = api_key_last6
+        await asyncio.to_thread(write_json_atomic, ckpt_path, state)
+        if unit_done_callback:
+            unit_done_callback(1)
+
+    out_row = build_out_row_from_state_wildguard(state, row, ds_idx, args)
     return RowResult(rid=rid, ckpt_path=ckpt_path, out_row=out_row)
 
 
@@ -635,9 +736,10 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument(
         "--datasets",
-        default="all",
-        choices=["all", "nq", "msmarco", "toxic"],
-        help="Dataset selection: all=run NQ then MS MARCO, or one dataset key (including toxic).",
+        nargs="+",
+        default=["all"],
+        choices=["all", "nq", "msmarco", "toxic", "wildguard"],
+        help="Dataset selection: pass one or more keys. 'all' expands to NQ+MS MARCO.",
     )
     p.add_argument("--split", default="train", choices=["train", "validation", "test"])
     p.add_argument("--out-dir", default="out_pl")
@@ -678,7 +780,12 @@ def parse_args() -> argparse.Namespace:
 
 def validate_dataset_schema(ds: Any, dataset_label: str, dataset_key: str) -> None:
     cols = set(getattr(ds, "column_names", []) or [])
-    required = REQUIRED_TOXIC_COLUMNS if dataset_key == "toxic" else REQUIRED_CONTEXT_RELEVANCE_COLUMNS
+    if dataset_key == "toxic":
+        required = REQUIRED_TOXIC_COLUMNS
+    elif dataset_key == "wildguard":
+        required = REQUIRED_WILDGUARD_COLUMNS
+    else:
+        required = REQUIRED_CONTEXT_RELEVANCE_COLUMNS
     missing = [c for c in required if c not in cols]
     if missing:
         raise RuntimeError(
@@ -697,7 +804,8 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
     failed_jsonl = os.path.join(args.out_dir, args.failed_jsonl_name)
     done_ids = load_done_ids_from_jsonl(out_jsonl)
 
-    ds = load_dataset(args.dataset, split=args.split)
+    hf_token = os.getenv("HF_TOKEN") or None
+    ds = load_dataset(args.dataset, split=args.split, token=hf_token)
     validate_dataset_schema(ds, args.dataset, args.dataset_key)
     total = len(ds)
 
@@ -726,6 +834,14 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
             if args.dataset_key == "toxic":
                 if checkpoint_is_complete_toxic(state):
                     append_jsonl(out_jsonl, build_out_row_from_state_toxic(state, row, ds_idx, args))
+                    done_ids.add(rid)
+                    state["status"] = "done"
+                    write_json_atomic(ckpt_path, state)
+                    recovered_from_ckpt += 1
+                    continue
+            elif args.dataset_key == "wildguard":
+                if checkpoint_is_complete_wildguard(state):
+                    append_jsonl(out_jsonl, build_out_row_from_state_wildguard(state, row, ds_idx, args))
                     done_ids.add(rid)
                     state["status"] = "done"
                     write_json_atomic(ckpt_path, state)
@@ -782,7 +898,7 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
     total_units = 0
     done_units_before = 0
     for ds_idx, row in candidates:
-        row_units = 1 if args.dataset_key == "toxic" else 1 + len(row["texts"])
+        row_units = 1 if args.dataset_key in ("toxic", "wildguard") else 1 + len(row["texts"])
         total_units += row_units
 
         rid = row["id"]
@@ -792,6 +908,9 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
 
         if args.dataset_key == "toxic":
             if state.get("comment_text_pl"):
+                done_units_before += 1
+        elif args.dataset_key == "wildguard":
+            if state.get("prompt_pl"):
                 done_units_before += 1
         else:
             if state.get("query_pl"):
@@ -852,6 +971,8 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
             async with sem:
                 if args.dataset_key == "toxic":
                     return await process_row_toxic(row, ds_idx, args, api_key_last6, client, mark_units_done)
+                if args.dataset_key == "wildguard":
+                    return await process_row_wildguard(row, ds_idx, args, api_key_last6, client, mark_units_done)
                 return await process_row(row, ds_idx, args, api_key_last6, client, mark_units_done)
 
         tasks = [asyncio.create_task(process_with_limit(ds_idx, row)) for ds_idx, row in candidates]
@@ -984,8 +1105,14 @@ async def run_async(args: argparse.Namespace) -> int:
     return 0
 
 
-def selected_dataset_keys(datasets_arg: str) -> list[str]:
-    return ["nq", "msmarco"] if datasets_arg == "all" else [datasets_arg]
+def selected_dataset_keys(datasets_arg: list[str]) -> list[str]:
+    out: list[str] = []
+    for key in datasets_arg:
+        expanded = ["nq", "msmarco"] if key == "all" else [key]
+        for item in expanded:
+            if item not in out:
+                out.append(item)
+    return out
 
 
 def main() -> int:

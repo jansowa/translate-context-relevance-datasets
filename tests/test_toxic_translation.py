@@ -2,7 +2,15 @@ import argparse
 import sys
 import types
 
-from translation_core import append_jsonl, build_toxic_comment_prompt, load_done_ids_from_jsonl
+import pytest
+
+from translation_core import (
+    append_jsonl,
+    build_toxic_comment_prompt,
+    build_wildguard_prompt,
+    load_done_ids_from_jsonl,
+    normalize_wildguard_subcategories,
+)
 
 
 if "openai" not in sys.modules:
@@ -31,6 +39,7 @@ if "tqdm" not in sys.modules:
 from run_translation_vllm import (  # noqa: E402
     TOXIC_LABEL_COLUMNS,
     build_out_row_from_state_toxic,
+    build_out_row_from_state_wildguard,
     parse_args,
     selected_dataset_keys,
 )
@@ -40,12 +49,31 @@ def test_parse_args_accepts_toxic_dataset(monkeypatch) -> None:
     monkeypatch.setenv("MODEL_NAME", "test-model")
     monkeypatch.setattr(sys, "argv", ["prog", "--datasets", "toxic"])
     args = parse_args()
-    assert args.datasets == "toxic"
+    assert args.datasets == ["toxic"]
+
+
+def test_parse_args_accepts_wildguard_dataset(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_NAME", "test-model")
+    monkeypatch.setattr(sys, "argv", ["prog", "--datasets", "wildguard"])
+    args = parse_args()
+    assert args.datasets == ["wildguard"]
 
 
 def test_selected_dataset_keys_all_excludes_toxic() -> None:
-    assert selected_dataset_keys("all") == ["nq", "msmarco"]
-    assert selected_dataset_keys("toxic") == ["toxic"]
+    assert selected_dataset_keys(["all"]) == ["nq", "msmarco"]
+    assert selected_dataset_keys(["toxic"]) == ["toxic"]
+    assert selected_dataset_keys(["wildguard"]) == ["wildguard"]
+
+
+def test_parse_args_accepts_multiple_datasets(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_NAME", "test-model")
+    monkeypatch.setattr(sys, "argv", ["prog", "--datasets", "toxic", "wildguard"])
+    args = parse_args()
+    assert args.datasets == ["toxic", "wildguard"]
+
+
+def test_selected_dataset_keys_expands_all_and_deduplicates() -> None:
+    assert selected_dataset_keys(["all", "toxic", "wildguard", "nq"]) == ["nq", "msmarco", "toxic", "wildguard"]
 
 
 def test_toxic_prompt_for_non_toxic_comment() -> None:
@@ -98,8 +126,74 @@ def test_toxic_output_row_contains_expected_fields() -> None:
         assert label in out
 
 
+def test_normalize_wildguard_subcategories_from_list() -> None:
+    out = normalize_wildguard_subcategories(["benign", "cyberattack", "benign"])
+    assert out == ["benign", "cyberattack"]
+
+
+def test_normalize_wildguard_subcategories_from_string() -> None:
+    out = normalize_wildguard_subcategories("benign")
+    assert out == ["benign"]
+
+
+def test_normalize_wildguard_subcategories_rejects_empty_or_unknown() -> None:
+    with pytest.raises(ValueError, match="empty"):
+        normalize_wildguard_subcategories([])
+    with pytest.raises(ValueError, match="unknown"):
+        normalize_wildguard_subcategories(["unknown_category"])
+
+
+def test_wildguard_prompt_benign_and_ordering() -> None:
+    prompt = build_wildguard_prompt("hello", ["benign"])
+    assert "benign and does not request harm" in prompt
+    output_pos = prompt.find("Output format:")
+    dynamic_pos = prompt.find("The source prompt is benign")
+    assert output_pos != -1
+    assert dynamic_pos != -1
+    assert output_pos < dynamic_pos
+
+
+def test_wildguard_prompt_multi_risk_contains_all_subcategories() -> None:
+    prompt = build_wildguard_prompt("hello", ["cyberattack", "fraud_assisting_illegal_activities"])
+    assert "- cyberattack:" in prompt
+    assert "- fraud_assisting_illegal_activities:" in prompt
+    assert "Do not sanitize or neutralize" in prompt
+
+
+def test_wildguard_output_row_contains_original_data_and_prompt_pl() -> None:
+    row = {
+        "id": "wg-1",
+        "prompt": "EN prompt",
+        "response": "EN response",
+        "subcategories": ["cyberattack"],
+        "extra_col": 123,
+    }
+    state = {"prompt_pl": "PL prompt", "active_model": "m1", "active_key_last6": "abcdef"}
+    args = argparse.Namespace(dataset_key="wildguard", dataset="allenai/wildguardmix", base_url="http://base")
+
+    out = build_out_row_from_state_wildguard(state, row, ds_idx=3, args=args)
+
+    assert out["id"] == "wg-1"
+    assert out["prompt"] == "EN prompt"
+    assert out["prompt_pl"] == "PL prompt"
+    assert out["response"] == "EN response"
+    assert out["subcategories"] == ["cyberattack"]
+    assert out["extra_col"] == 123
+    assert out["translation_model"] == "m1"
+    assert out["translation_key_last6"] == "abcdef"
+    assert out["translation_base_url"] == "http://base"
+    assert out["dataset_index"] == 3
+
+
 def test_resume_ids_loaded_from_toxic_jsonl(tmp_path) -> None:
     out_path = tmp_path / "translated.jsonl"
     append_jsonl(str(out_path), {"id": "toxic-row-1", "comment_text_pl": "ok"})
     done_ids = load_done_ids_from_jsonl(str(out_path))
     assert "toxic-row-1" in done_ids
+
+
+def test_resume_ids_loaded_from_wildguard_jsonl(tmp_path) -> None:
+    out_path = tmp_path / "translated.jsonl"
+    append_jsonl(str(out_path), {"id": "wg-row-1", "prompt_pl": "ok"})
+    done_ids = load_done_ids_from_jsonl(str(out_path))
+    assert "wg-row-1" in done_ids

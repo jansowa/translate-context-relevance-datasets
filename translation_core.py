@@ -192,6 +192,12 @@ SYSTEM_TEXT = (
     "In 'think_process', keep indices like 'Sentence [1]' etc. (translate only the surrounding text)."
 )
 
+SYSTEM_TEXT_SIMPLE = (
+    "You are an EN->PL translator for NLP data. Return ONLY valid JSON. "
+    "Do not add any comments or markdown. "
+    "Preserve meaning, intent, proper names, numbers, and quotations."
+)
+
 TOXIC_LABEL_DESCRIPTIONS: dict[str, str] = {
     "toxic": "ogolnie toksyczny komentarz (wrogi, obrazliwy, agresywny)",
     "severe_toxic": "silnie toksyczny / ekstremalnie toksyczny komentarz (bardziej skrajny podzbior toxic)",
@@ -200,6 +206,104 @@ TOXIC_LABEL_DESCRIPTIONS: dict[str, str] = {
     "insult": "wyzwiska lub bezposrednie obrazanie osoby albo grupy",
     "identity_hate": "mowa nienawisci wobec tozsamosci (np. rasa, religia, plec, orientacja)",
 }
+
+WILDGUARD_SUBCATEGORY_DESCRIPTIONS: dict[str, str] = {
+    "benign": "Nieszkodliwy, bezpieczny prompt (brak intencji wywolania szkody).",
+    "causing_material_harm_by_disseminating_misinformation": (
+        "Misinformacja, ktora moze prowadzic do realnej szkody (np. zdrowie, prawo, bezpieczenstwo)."
+    ),
+    "copyright_violations": "Prosby o naruszenie praw autorskich (piractwo, nielegalne kopiowanie lub udostepnianie).",
+    "cyberattack": "Instrukcje lub pomoc w atakach cybernetycznych (malware, wlamania, exploitacja).",
+    "defamation_encouraging_unethical_or_unsafe_actions": (
+        "Tresci znieslawiajace lub zachecajace do nieetycznych albo niebezpiecznych dzialan."
+    ),
+    "disseminating_false_or_misleading_information_encouraging_disinformation_campaigns": (
+        "Tworzenie lub rozpowszechnianie falszywych lub wprowadzajacych w blad informacji, "
+        "w tym wsparcie kampanii dezinformacyjnych."
+    ),
+    "fraud_assisting_illegal_activities": (
+        "Wsparcie oszustw i innych dzialan nielegalnych (scamy, wyludzenia, obejscia prawa)."
+    ),
+    "mental_health_over-reliance_crisis": (
+        "Tresci ryzykowne dla zdrowia psychicznego lub promujace niebezpieczne nadmierne poleganie na asystencie."
+    ),
+    "others": "Inne szkody, ktore nie pasuja jasno do pozostalych kategorii.",
+    "private_information_individual": (
+        "Prywatne dane osoby fizycznej (PII, dane medyczne, dane kontaktowe itp.)."
+    ),
+    "sensitive_information_organization_government": (
+        "Wrazliwe informacje organizacji lub instytucji lub rzadu (np. dane poufne, operacyjne, bezpieczenstwa)."
+    ),
+    "sexual_content": "Tresci seksualne lub erotyczne.",
+    "social_stereotypes_and_unfair_discrimination": (
+        "Stereotypy spoleczne i niesprawiedliwa dyskryminacja grup."
+    ),
+    "toxic_language_hate_speech": "Jezyk toksyczny, obrazliwy, mowa nienawisci.",
+    "violence_and_physical_harm": "Przemoc i tresci dotyczace wyrazdzania szkody fizycznej.",
+}
+
+
+def normalize_wildguard_subcategories(raw_value: Any) -> List[str]:
+    if raw_value is None:
+        raise ValueError("subcategories is null")
+
+    if isinstance(raw_value, str):
+        values = [raw_value]
+    elif isinstance(raw_value, list):
+        values = [x for x in raw_value if isinstance(x, str)]
+        if len(values) != len(raw_value):
+            raise ValueError("subcategories contains non-string values")
+    else:
+        raise ValueError(f"subcategories has unsupported type: {type(raw_value).__name__}")
+
+    cleaned = []
+    seen = set()
+    for item in values:
+        key = item.strip()
+        if not key:
+            continue
+        if key not in seen:
+            seen.add(key)
+            cleaned.append(key)
+
+    if not cleaned:
+        raise ValueError("subcategories is empty")
+
+    unknown = [x for x in cleaned if x not in WILDGUARD_SUBCATEGORY_DESCRIPTIONS]
+    if unknown:
+        raise ValueError(f"unknown subcategories: {unknown}")
+
+    return cleaned
+
+
+def build_wildguard_prompt(prompt_en: str, subcategories: List[str]) -> str:
+    if subcategories == ["benign"]:
+        risk_instruction = (
+            "The source prompt is benign and does not request harm.\n"
+            "Keep the Polish translation benign and safe. Do not introduce harmful intent."
+        )
+    else:
+        subcats_block = "\n".join(
+            [f"- {name}: {WILDGUARD_SUBCATEGORY_DESCRIPTIONS[name]}" for name in subcategories]
+        )
+        risk_instruction = (
+            "The source prompt has harmful-risk intent.\n"
+            "Preserve the same intent and risk profile in Polish.\n"
+            "Do not sanitize or neutralize the harmful aspects.\n"
+            "Active subcategories:\n"
+            f"{subcats_block}"
+        )
+
+    return (
+        "Translate the English prompt into Polish.\n"
+        "Return ONLY valid JSON.\n"
+        "Do not add explanations, markdown, or extra keys.\n\n"
+        "Output format:\n"
+        '{"prompt_pl": "..."}\n\n'
+        f"{risk_instruction}\n\n"
+        "INPUT DATA:\n"
+        f"PROMPT (EN): {prompt_en}"
+    )
 
 
 def build_toxic_comment_prompt(comment_text_en: str, active_toxic_types: List[str]) -> str:

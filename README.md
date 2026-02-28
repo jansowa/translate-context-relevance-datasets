@@ -5,6 +5,7 @@ Currently supported:
 - `zilliz/natural_questions-context-relevance-with-think` (`nq`)
 - `zilliz/msmarco-context-relevance-with-think` (`msmarco`)
 - `thesofakillers/jigsaw-toxic-comment-classification-challenge` (`toxic`, opt-in only)
+- `allenai/wildguardmix` (`wildguard`, opt-in only)
 
 The pipeline runs locally using **vLLM (OpenAI-compatible API)** and a separate **translator** container.
 Results are written to JSONL, and progress is persisted with checkpoints so the process can be safely resumed.
@@ -33,6 +34,7 @@ Key variables in `.env`:
 - `VLLM_MAX_NUM_SEQS` (optional) - passed to `--max-num-seqs` only when set
 - `VLLM_MAX_NUM_BATCHED_TOKENS` (optional) - passed to `--max-num-batched-tokens` only when set
 - `VLLM_ENFORCE_EAGER` (optional) - if set to `1`, enables `--enforce-eager`
+- `HF_TOKEN` (optional/required for gated datasets) - Hugging Face token used by `load_dataset`
 
 Available profiles:
 
@@ -55,14 +57,18 @@ docker compose run --rm translator
 ```
 
 By default, the translator runs both context-relevance datasets sequentially (`nq` then `msmarco`).
-The `toxic` dataset is not included in `all` and runs only when explicitly selected.
+The `toxic` and `wildguard` datasets are not included in `all` and run only when explicitly selected.
 Use `--datasets` to limit the run:
 
 ```bash
 docker compose run --rm translator --datasets nq
 docker compose run --rm translator --datasets msmarco
 docker compose run --rm translator --datasets toxic --split train
+docker compose run --rm translator --datasets wildguard --split train
+docker compose run --rm translator --datasets toxic wildguard --split train
 ```
+
+You can pass multiple dataset keys in one run; duplicates are ignored.
 
 ## First test on a small GPU (e.g. 8 GB VRAM)
 
@@ -90,6 +96,7 @@ Output files are written inside the repository directory, in separate subfolders
 - `out_pl/nq/translated.jsonl`, `out_pl/nq/failed_rows.jsonl`, `out_pl/nq/checkpoints/*.json`
 - `out_pl/msmarco/translated.jsonl`, `out_pl/msmarco/failed_rows.jsonl`, `out_pl/msmarco/checkpoints/*.json`
 - `out_pl/toxic/translated.jsonl`, `out_pl/toxic/failed_rows.jsonl`, `out_pl/toxic/checkpoints/*.json`
+- `out_pl/wildguard/translated.jsonl`, `out_pl/wildguard/failed_rows.jsonl`, `out_pl/wildguard/checkpoints/*.json`
 
 You can resume processing by running the translator again with the same parameters.
 Already completed records are skipped.
