@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import hashlib
 import logging
 import os
 import openai
@@ -70,10 +71,14 @@ REQUIRED_TOXIC_COLUMNS = (
 WILDGUARD_SUBCATEGORY_COLUMNS = tuple(WILDGUARD_SUBCATEGORY_DESCRIPTIONS.keys())
 
 REQUIRED_WILDGUARD_COLUMNS = (
-    "id",
     "prompt",
-    "subcategories",
+    "subcategory",
 )
+
+WILDGUARD_CONFIG_BY_SPLIT = {
+    "train": "wildguardtrain",
+    "test": "wildguardtest",
+}
 
 
 def format_seconds(seconds: float) -> str:
@@ -150,6 +155,21 @@ def checkpoint_is_complete_wildguard(state: dict[str, Any]) -> bool:
     return bool(state.get("prompt_pl"))
 
 
+def resolve_row_id(row: dict[str, Any], ds_idx: int, dataset_key: str) -> str:
+    rid = row.get("id")
+    if rid is not None:
+        rid_s = str(rid).strip()
+        if rid_s:
+            return rid_s
+
+    if dataset_key == "wildguard":
+        stable_payload = "|".join([f"{k}={row.get(k)!r}" for k in sorted(row.keys())])
+        digest = hashlib.sha1(stable_payload.encode("utf-8")).hexdigest()[:20]
+        return f"wildguard_{digest}"
+
+    return f"{dataset_key}_{ds_idx}"
+
+
 def active_toxic_types_from_row(row: dict[str, Any]) -> list[str]:
     active = []
     for label in TOXIC_LABEL_COLUMNS:
@@ -222,7 +242,7 @@ def build_out_row_from_state_wildguard(
     out_row = dict(row)
     out_row.update(
         {
-            "id": row["id"],
+            "id": state["id"],
             "source_dataset": args.dataset_key,
             "source_dataset_hf": args.dataset,
             "prompt_pl": state["prompt_pl"],
@@ -634,11 +654,11 @@ async def process_row_wildguard(
     client: AsyncOpenAI,
     unit_done_callback: Callable[[int], None] | None = None,
 ) -> RowResult:
-    rid = row["id"]
+    rid = resolve_row_id(row, ds_idx, args.dataset_key)
     stem = checkpoint_stem_from_id(rid)
     ckpt_path = os.path.join(args.checkpoint_dir, f"{stem}.json")
 
-    subcategories = normalize_wildguard_subcategories(row.get("subcategories"))
+    subcategories = normalize_wildguard_subcategories(row.get("subcategory"))
 
     state = await asyncio.to_thread(read_json, ckpt_path) or {}
     if not state:
@@ -793,6 +813,21 @@ def validate_dataset_schema(ds: Any, dataset_label: str, dataset_key: str) -> No
         )
 
 
+def load_dataset_for_run(dataset_hf_id: str, dataset_key: str, split: str, hf_token: str | None) -> Any:
+    if dataset_key == "wildguard":
+        config_name = WILDGUARD_CONFIG_BY_SPLIT.get(split)
+        if config_name is None:
+            supported = ", ".join(sorted(WILDGUARD_CONFIG_BY_SPLIT.keys()))
+            raise RuntimeError(
+                f"Dataset '{dataset_hf_id}' does not support split='{split}'. "
+                f"Use one of: {supported}."
+            )
+        # WildGuard uses config names for train/test variants; each config exposes a train split.
+        return load_dataset(dataset_hf_id, name=config_name, split="train", token=hf_token)
+
+    return load_dataset(dataset_hf_id, split=split, token=hf_token)
+
+
 async def run_single_dataset_async(args: argparse.Namespace) -> int:
     if args.checkpoint_dir is None:
         args.checkpoint_dir = os.path.join(args.out_dir, "checkpoints")
@@ -805,7 +840,7 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
     done_ids = load_done_ids_from_jsonl(out_jsonl)
 
     hf_token = os.getenv("HF_TOKEN") or None
-    ds = load_dataset(args.dataset, split=args.split, token=hf_token)
+    ds = load_dataset_for_run(args.dataset, args.dataset_key, args.split, hf_token)
     validate_dataset_schema(ds, args.dataset, args.dataset_key)
     total = len(ds)
 
@@ -822,7 +857,7 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
     candidates_fresh: list[tuple[int, dict[str, Any]]] = []
     for ds_idx in range(start_idx, end_idx):
         row = ds[ds_idx]
-        rid = row["id"]
+        rid = resolve_row_id(row, ds_idx, args.dataset_key)
         if rid in done_ids:
             continue
 
@@ -901,7 +936,7 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
         row_units = 1 if args.dataset_key in ("toxic", "wildguard") else 1 + len(row["texts"])
         total_units += row_units
 
-        rid = row["id"]
+        rid = resolve_row_id(row, ds_idx, args.dataset_key)
         stem = checkpoint_stem_from_id(rid)
         ckpt_path = os.path.join(args.checkpoint_dir, f"{stem}.json")
         state = read_json(ckpt_path) or {}
@@ -977,7 +1012,7 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
 
         tasks = [asyncio.create_task(process_with_limit(ds_idx, row)) for ds_idx, row in candidates]
         task_meta: dict[asyncio.Task[RowResult], tuple[int, str]] = {
-            task: (ds_idx, row["id"]) for task, (ds_idx, row) in zip(tasks, candidates)
+            task: (ds_idx, resolve_row_id(row, ds_idx, args.dataset_key)) for task, (ds_idx, row) in zip(tasks, candidates)
         }
         failed_rows = 0
         try:

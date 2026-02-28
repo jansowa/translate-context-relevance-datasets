@@ -40,7 +40,9 @@ from run_translation_vllm import (  # noqa: E402
     TOXIC_LABEL_COLUMNS,
     build_out_row_from_state_toxic,
     build_out_row_from_state_wildguard,
+    load_dataset_for_run,
     parse_args,
+    resolve_row_id,
     selected_dataset_keys,
 )
 
@@ -74,6 +76,46 @@ def test_parse_args_accepts_multiple_datasets(monkeypatch) -> None:
 
 def test_selected_dataset_keys_expands_all_and_deduplicates() -> None:
     assert selected_dataset_keys(["all", "toxic", "wildguard", "nq"]) == ["nq", "msmarco", "toxic", "wildguard"]
+
+
+def test_load_dataset_for_run_maps_wildguard_train_to_config(monkeypatch) -> None:
+    called = {}
+
+    def fake_load_dataset(dataset_hf_id, **kwargs):
+        called["dataset_hf_id"] = dataset_hf_id
+        called["kwargs"] = kwargs
+        return "ok"
+
+    monkeypatch.setattr("run_translation_vllm.load_dataset", fake_load_dataset)
+
+    out = load_dataset_for_run("allenai/wildguardmix", "wildguard", "train", "hf_xxx")
+    assert out == "ok"
+    assert called["dataset_hf_id"] == "allenai/wildguardmix"
+    assert called["kwargs"]["name"] == "wildguardtrain"
+    assert called["kwargs"]["split"] == "train"
+    assert called["kwargs"]["token"] == "hf_xxx"
+
+
+def test_load_dataset_for_run_maps_wildguard_test_to_config(monkeypatch) -> None:
+    called = {}
+
+    def fake_load_dataset(dataset_hf_id, **kwargs):
+        called["dataset_hf_id"] = dataset_hf_id
+        called["kwargs"] = kwargs
+        return "ok"
+
+    monkeypatch.setattr("run_translation_vllm.load_dataset", fake_load_dataset)
+
+    out = load_dataset_for_run("allenai/wildguardmix", "wildguard", "test", None)
+    assert out == "ok"
+    assert called["kwargs"]["name"] == "wildguardtest"
+    assert called["kwargs"]["split"] == "train"
+    assert called["kwargs"]["token"] is None
+
+
+def test_load_dataset_for_run_rejects_wildguard_validation() -> None:
+    with pytest.raises(RuntimeError, match="does not support split='validation'"):
+        load_dataset_for_run("allenai/wildguardmix", "wildguard", "validation", None)
 
 
 def test_toxic_prompt_for_non_toxic_comment() -> None:
@@ -162,13 +204,12 @@ def test_wildguard_prompt_multi_risk_contains_all_subcategories() -> None:
 
 def test_wildguard_output_row_contains_original_data_and_prompt_pl() -> None:
     row = {
-        "id": "wg-1",
         "prompt": "EN prompt",
         "response": "EN response",
-        "subcategories": ["cyberattack"],
+        "subcategory": "cyberattack",
         "extra_col": 123,
     }
-    state = {"prompt_pl": "PL prompt", "active_model": "m1", "active_key_last6": "abcdef"}
+    state = {"id": "wg-1", "prompt_pl": "PL prompt", "active_model": "m1", "active_key_last6": "abcdef"}
     args = argparse.Namespace(dataset_key="wildguard", dataset="allenai/wildguardmix", base_url="http://base")
 
     out = build_out_row_from_state_wildguard(state, row, ds_idx=3, args=args)
@@ -177,7 +218,7 @@ def test_wildguard_output_row_contains_original_data_and_prompt_pl() -> None:
     assert out["prompt"] == "EN prompt"
     assert out["prompt_pl"] == "PL prompt"
     assert out["response"] == "EN response"
-    assert out["subcategories"] == ["cyberattack"]
+    assert out["subcategory"] == "cyberattack"
     assert out["extra_col"] == 123
     assert out["translation_model"] == "m1"
     assert out["translation_key_last6"] == "abcdef"
@@ -197,3 +238,16 @@ def test_resume_ids_loaded_from_wildguard_jsonl(tmp_path) -> None:
     append_jsonl(str(out_path), {"id": "wg-row-1", "prompt_pl": "ok"})
     done_ids = load_done_ids_from_jsonl(str(out_path))
     assert "wg-row-1" in done_ids
+
+
+def test_resolve_row_id_for_wildguard_without_source_id_is_stable() -> None:
+    row = {
+        "prompt": "hello",
+        "response": "resp",
+        "subcategory": "benign",
+        "adversarial": False,
+    }
+    rid1 = resolve_row_id(row, ds_idx=10, dataset_key="wildguard")
+    rid2 = resolve_row_id(row, ds_idx=10, dataset_key="wildguard")
+    assert rid1 == rid2
+    assert rid1.startswith("wildguard_")
