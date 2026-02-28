@@ -54,6 +54,15 @@ def test_toxic_prompt_for_non_toxic_comment() -> None:
     assert "non-toxic" in prompt
 
 
+def test_toxic_prompt_puts_stable_output_format_before_variable_instructions() -> None:
+    prompt = build_toxic_comment_prompt("Sample comment", ["threat"])
+    output_pos = prompt.find("Output format:")
+    toxicity_pos = prompt.find("The source comment is toxic.")
+    assert output_pos != -1
+    assert toxicity_pos != -1
+    assert output_pos < toxicity_pos
+
+
 def test_toxic_prompt_for_multiple_toxicity_types() -> None:
     prompt = build_toxic_comment_prompt("Sample comment", ["threat", "insult", "identity_hate"])
     assert "- threat:" in prompt

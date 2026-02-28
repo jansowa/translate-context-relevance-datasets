@@ -223,9 +223,9 @@ def build_toxic_comment_prompt(comment_text_en: str, active_toxic_types: List[st
         "Translate the English comment into Polish.\n"
         "Return ONLY valid JSON.\n"
         "Do not add explanations, markdown, or extra keys.\n\n"
-        f"{toxicity_instruction}\n\n"
         "Output format:\n"
         '{"comment_text_pl": "..."}\n\n'
+        f"{toxicity_instruction}\n\n"
         "INPUT DATA:\n"
         f"COMMENT (EN): {comment_text_en}"
     )
