@@ -20,8 +20,10 @@ from tqdm import tqdm
 from translation_core import (
     SYSTEM_QUERY,
     SYSTEM_TEXT,
+    TOXIC_LABEL_DESCRIPTIONS,
     RateLimitReached,
     append_jsonl,
+    build_toxic_comment_prompt,
     build_text_prompt,
     build_text_prompt_dictforced,
     build_text_prompt_strict,
@@ -39,9 +41,10 @@ from translation_core import (
 DATASET_PRESETS: dict[str, str] = {
     "nq": "zilliz/natural_questions-context-relevance-with-think",
     "msmarco": "zilliz/msmarco-context-relevance-with-think",
+    "toxic": "thesofakillers/jigsaw-toxic-comment-classification-challenge",
 }
 
-REQUIRED_DATASET_COLUMNS = (
+REQUIRED_CONTEXT_RELEVANCE_COLUMNS = (
     "id",
     "query",
     "texts",
@@ -49,6 +52,14 @@ REQUIRED_DATASET_COLUMNS = (
     "context_spans_relevance",
     "labels",
     "think_process",
+)
+
+TOXIC_LABEL_COLUMNS = tuple(TOXIC_LABEL_DESCRIPTIONS.keys())
+
+REQUIRED_TOXIC_COLUMNS = (
+    "id",
+    "comment_text",
+    *TOXIC_LABEL_COLUMNS,
 )
 
 
@@ -118,6 +129,18 @@ def checkpoint_is_complete(state: dict[str, Any], expected_texts: int) -> bool:
     return True
 
 
+def checkpoint_is_complete_toxic(state: dict[str, Any]) -> bool:
+    return bool(state.get("comment_text_pl"))
+
+
+def active_toxic_types_from_row(row: dict[str, Any]) -> list[str]:
+    active = []
+    for label in TOXIC_LABEL_COLUMNS:
+        if int(row[label]) == 1:
+            active.append(label)
+    return active
+
+
 def build_out_row_from_state(
     state: dict[str, Any],
     row: dict[str, Any],
@@ -148,6 +171,28 @@ def build_out_row_from_state(
                 "think_process_en": row["think_process"],
             }
         )
+    return out_row
+
+
+def build_out_row_from_state_toxic(
+    state: dict[str, Any],
+    row: dict[str, Any],
+    ds_idx: int,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    out_row: dict[str, Any] = {
+        "id": row["id"],
+        "source_dataset": args.dataset_key,
+        "source_dataset_hf": args.dataset,
+        "comment_text": row["comment_text"],
+        "comment_text_pl": state["comment_text_pl"],
+        "translation_model": state.get("active_model"),
+        "translation_key_last6": state.get("active_key_last6"),
+        "translation_base_url": (args.base_url or None),
+        "dataset_index": ds_idx,
+    }
+    for label in TOXIC_LABEL_COLUMNS:
+        out_row[label] = int(row[label])
     return out_row
 
 
@@ -480,6 +525,68 @@ async def process_row(
     return RowResult(rid=rid, ckpt_path=ckpt_path, out_row=out_row)
 
 
+async def process_row_toxic(
+    row: dict[str, Any],
+    ds_idx: int,
+    args: argparse.Namespace,
+    api_key_last6: str,
+    client: AsyncOpenAI,
+    unit_done_callback: Callable[[int], None] | None = None,
+) -> RowResult:
+    rid = row["id"]
+    stem = checkpoint_stem_from_id(rid)
+    ckpt_path = os.path.join(args.checkpoint_dir, f"{stem}.json")
+
+    state = await asyncio.to_thread(read_json, ckpt_path) or {}
+    if not state:
+        state = {
+            "id": rid,
+            "comment_text_en": row["comment_text"],
+            "comment_text_pl": None,
+            "status": "in_progress",
+            "active_model": None,
+            "active_key_last6": None,
+            "dataset_index": ds_idx,
+        }
+        for label in TOXIC_LABEL_COLUMNS:
+            state[label] = int(row[label])
+        await asyncio.to_thread(write_json_atomic, ckpt_path, state)
+
+    if not state.get("comment_text_pl"):
+        active_toxic_types = active_toxic_types_from_row(row)
+        prompt = build_toxic_comment_prompt(
+            comment_text_en=row["comment_text"],
+            active_toxic_types=active_toxic_types,
+        )
+        schema = {
+            "type": "object",
+            "properties": {"comment_text_pl": {"type": "string"}},
+            "required": ["comment_text_pl"],
+            "additionalProperties": False,
+        }
+        translated_obj = await llm_call_json_async(
+            client=client,
+            model=args.model,
+            system_prompt=SYSTEM_TEXT,
+            user_prompt=prompt,
+            temperature=args.temperature,
+            max_retries=args.max_retries,
+            delay_seconds=args.delay_seconds,
+            response_schema=schema,
+        )
+        state["comment_text_pl"] = (translated_obj.get("comment_text_pl") or "").strip()
+        if not state["comment_text_pl"]:
+            raise RuntimeError("Empty comment_text_pl from model")
+        state["active_model"] = args.model
+        state["active_key_last6"] = api_key_last6
+        await asyncio.to_thread(write_json_atomic, ckpt_path, state)
+        if unit_done_callback:
+            unit_done_callback(1)
+
+    out_row = build_out_row_from_state_toxic(state, row, ds_idx, args)
+    return RowResult(rid=rid, ckpt_path=ckpt_path, out_row=out_row)
+
+
 async def writer_loop(
     q: asyncio.Queue[RowResult | None],
     out_jsonl: str,
@@ -529,8 +636,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--datasets",
         default="all",
-        choices=["all", "nq", "msmarco"],
-        help="Dataset selection: all=run NQ then MS MARCO, or a single dataset key.",
+        choices=["all", "nq", "msmarco", "toxic"],
+        help="Dataset selection: all=run NQ then MS MARCO, or one dataset key (including toxic).",
     )
     p.add_argument("--split", default="train", choices=["train", "validation", "test"])
     p.add_argument("--out-dir", default="out_pl")
@@ -569,9 +676,10 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def validate_dataset_schema(ds: Any, dataset_label: str) -> None:
+def validate_dataset_schema(ds: Any, dataset_label: str, dataset_key: str) -> None:
     cols = set(getattr(ds, "column_names", []) or [])
-    missing = [c for c in REQUIRED_DATASET_COLUMNS if c not in cols]
+    required = REQUIRED_TOXIC_COLUMNS if dataset_key == "toxic" else REQUIRED_CONTEXT_RELEVANCE_COLUMNS
+    missing = [c for c in required if c not in cols]
     if missing:
         raise RuntimeError(
             f"Dataset '{dataset_label}' is missing required columns: {missing}. Available columns: {sorted(cols)}"
@@ -590,7 +698,7 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
     done_ids = load_done_ids_from_jsonl(out_jsonl)
 
     ds = load_dataset(args.dataset, split=args.split)
-    validate_dataset_schema(ds, args.dataset)
+    validate_dataset_schema(ds, args.dataset, args.dataset_key)
     total = len(ds)
 
     skip = max(0, int(args.skip_rows))
@@ -614,13 +722,22 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
         ckpt_path = os.path.join(args.checkpoint_dir, f"{stem}.json")
         state = read_json(ckpt_path) or {}
 
-        if state and checkpoint_is_complete(state, expected_texts=len(row["texts"])):
-            append_jsonl(out_jsonl, build_out_row_from_state(state, row, ds_idx, args))
-            done_ids.add(rid)
-            state["status"] = "done"
-            write_json_atomic(ckpt_path, state)
-            recovered_from_ckpt += 1
-            continue
+        if state:
+            if args.dataset_key == "toxic":
+                if checkpoint_is_complete_toxic(state):
+                    append_jsonl(out_jsonl, build_out_row_from_state_toxic(state, row, ds_idx, args))
+                    done_ids.add(rid)
+                    state["status"] = "done"
+                    write_json_atomic(ckpt_path, state)
+                    recovered_from_ckpt += 1
+                    continue
+            elif checkpoint_is_complete(state, expected_texts=len(row["texts"])):
+                append_jsonl(out_jsonl, build_out_row_from_state(state, row, ds_idx, args))
+                done_ids.add(rid)
+                state["status"] = "done"
+                write_json_atomic(ckpt_path, state)
+                recovered_from_ckpt += 1
+                continue
 
         if state:
             candidates_with_ckpt.append((ds_idx, row))
@@ -665,7 +782,7 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
     total_units = 0
     done_units_before = 0
     for ds_idx, row in candidates:
-        row_units = 1 + len(row["texts"])
+        row_units = 1 if args.dataset_key == "toxic" else 1 + len(row["texts"])
         total_units += row_units
 
         rid = row["id"]
@@ -673,16 +790,20 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
         ckpt_path = os.path.join(args.checkpoint_dir, f"{stem}.json")
         state = read_json(ckpt_path) or {}
 
-        if state.get("query_pl"):
-            done_units_before += 1
+        if args.dataset_key == "toxic":
+            if state.get("comment_text_pl"):
+                done_units_before += 1
+        else:
+            if state.get("query_pl"):
+                done_units_before += 1
 
-        done_idxs = {int(x) for x in state.get("done_text_idxs", []) if isinstance(x, int)}
-        done_units_before += len([i for i in done_idxs if 0 <= i < len(row["texts"])])
+            done_idxs = {int(x) for x in state.get("done_text_idxs", []) if isinstance(x, int)}
+            done_units_before += len([i for i in done_idxs if 0 <= i < len(row["texts"])])
 
     if total_units > 0:
         done_units_before = min(done_units_before, total_units)
     logging.info(
-        "Checkpoint units: %d/%d done at start (unit = query + one text)",
+        "Checkpoint units: %d/%d done at start",
         done_units_before,
         total_units,
     )
@@ -729,6 +850,8 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
     async with AsyncOpenAI(api_key=args.api_key, base_url=args.base_url) as client:
         async def process_with_limit(ds_idx: int, row: dict[str, Any]) -> RowResult:
             async with sem:
+                if args.dataset_key == "toxic":
+                    return await process_row_toxic(row, ds_idx, args, api_key_last6, client, mark_units_done)
                 return await process_row(row, ds_idx, args, api_key_last6, client, mark_units_done)
 
         tasks = [asyncio.create_task(process_with_limit(ds_idx, row)) for ds_idx, row in candidates]
@@ -833,7 +956,7 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
 
 
 async def run_async(args: argparse.Namespace) -> int:
-    selected_keys = ["nq", "msmarco"] if args.datasets == "all" else [args.datasets]
+    selected_keys = selected_dataset_keys(args.datasets)
     runs: list[tuple[str, str]] = [(k, DATASET_PRESETS[k]) for k in selected_keys]
 
     logging.info(
@@ -859,6 +982,10 @@ async def run_async(args: argparse.Namespace) -> int:
             return rc
 
     return 0
+
+
+def selected_dataset_keys(datasets_arg: str) -> list[str]:
+    return ["nq", "msmarco"] if datasets_arg == "all" else [datasets_arg]
 
 
 def main() -> int:

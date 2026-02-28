@@ -4,6 +4,7 @@ This repository provides a tool for translating context-relevance HuggingFace da
 Currently supported:
 - `zilliz/natural_questions-context-relevance-with-think` (`nq`)
 - `zilliz/msmarco-context-relevance-with-think` (`msmarco`)
+- `thesofakillers/jigsaw-toxic-comment-classification-challenge` (`toxic`, opt-in only)
 
 The pipeline runs locally using **vLLM (OpenAI-compatible API)** and a separate **translator** container.
 Results are written to JSONL, and progress is persisted with checkpoints so the process can be safely resumed.
@@ -53,12 +54,14 @@ docker compose up -d --build vllm
 docker compose run --rm translator
 ```
 
-By default, the translator runs both datasets sequentially (`nq` then `msmarco`).
+By default, the translator runs both context-relevance datasets sequentially (`nq` then `msmarco`).
+The `toxic` dataset is not included in `all` and runs only when explicitly selected.
 Use `--datasets` to limit the run:
 
 ```bash
 docker compose run --rm translator --datasets nq
 docker compose run --rm translator --datasets msmarco
+docker compose run --rm translator --datasets toxic --split train
 ```
 
 ## First test on a small GPU (e.g. 8 GB VRAM)
@@ -86,6 +89,7 @@ Output files are written inside the repository directory, in separate subfolders
 
 - `out_pl/nq/translated.jsonl`, `out_pl/nq/failed_rows.jsonl`, `out_pl/nq/checkpoints/*.json`
 - `out_pl/msmarco/translated.jsonl`, `out_pl/msmarco/failed_rows.jsonl`, `out_pl/msmarco/checkpoints/*.json`
+- `out_pl/toxic/translated.jsonl`, `out_pl/toxic/failed_rows.jsonl`, `out_pl/toxic/checkpoints/*.json`
 
 You can resume processing by running the translator again with the same parameters.
 Already completed records are skipped.

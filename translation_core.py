@@ -192,6 +192,44 @@ SYSTEM_TEXT = (
     "In 'think_process', keep indices like 'Sentence [1]' etc. (translate only the surrounding text)."
 )
 
+TOXIC_LABEL_DESCRIPTIONS: dict[str, str] = {
+    "toxic": "ogolnie toksyczny komentarz (wrogi, obrazliwy, agresywny)",
+    "severe_toxic": "silnie toksyczny / ekstremalnie toksyczny komentarz (bardziej skrajny podzbior toxic)",
+    "obscene": "tresc obsceniczna lub wulgarna",
+    "threat": "grozby przemocy lub zastraszanie",
+    "insult": "wyzwiska lub bezposrednie obrazanie osoby albo grupy",
+    "identity_hate": "mowa nienawisci wobec tozsamosci (np. rasa, religia, plec, orientacja)",
+}
+
+
+def build_toxic_comment_prompt(comment_text_en: str, active_toxic_types: List[str]) -> str:
+    if active_toxic_types:
+        active_block = "\n".join(
+            [f"- {label}: {TOXIC_LABEL_DESCRIPTIONS[label]}" for label in active_toxic_types]
+        )
+        toxicity_instruction = (
+            "The source comment is toxic. Preserve the same toxicity types in the Polish translation.\n"
+            "Do not sanitize, soften, or neutralize the toxicity. Keep intent and severity.\n"
+            "Active toxicity types in this comment:\n"
+            f"{active_block}"
+        )
+    else:
+        toxicity_instruction = (
+            "The source comment is NOT toxic (all toxicity labels are 0).\n"
+            "Keep the Polish translation non-toxic as well. Do not introduce any toxic content."
+        )
+
+    return (
+        "Translate the English comment into Polish.\n"
+        "Return ONLY valid JSON.\n"
+        "Do not add explanations, markdown, or extra keys.\n\n"
+        f"{toxicity_instruction}\n\n"
+        "Output format:\n"
+        '{"comment_text_pl": "..."}\n\n'
+        "INPUT DATA:\n"
+        f"COMMENT (EN): {comment_text_en}"
+    )
+
 
 def build_query_prompt(query_en: str, positive_fragments: List[str]) -> str:
     frags = "\n".join([f"[{i + 1}] {t}" for i, t in enumerate(positive_fragments)]) or "(none)"
