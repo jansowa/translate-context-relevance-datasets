@@ -42,7 +42,9 @@ from run_translation_vllm import (  # noqa: E402
     build_out_row_from_state_wildguard,
     load_dataset_for_run,
     parse_args,
+    reorder_candidates_for_prompt_cache,
     resolve_row_id,
+    row_cache_group_key,
     selected_dataset_keys,
 )
 
@@ -251,3 +253,46 @@ def test_resolve_row_id_for_wildguard_without_source_id_is_stable() -> None:
     rid2 = resolve_row_id(row, ds_idx=10, dataset_key="wildguard")
     assert rid1 == rid2
     assert rid1.startswith("wildguard_")
+
+
+def test_row_cache_group_key_for_toxic_uses_active_labels_order() -> None:
+    row = {
+        "toxic": 1,
+        "severe_toxic": 0,
+        "obscene": 1,
+        "threat": 0,
+        "insult": 1,
+        "identity_hate": 0,
+    }
+    assert row_cache_group_key("toxic", row) == ("toxic", "obscene", "insult")
+
+
+def test_row_cache_group_key_for_wildguard_normalizes_subcategories() -> None:
+    row = {"subcategory": ["cyberattack", "benign", "cyberattack"]}
+    assert row_cache_group_key("wildguard", row) == ("cyberattack", "benign")
+
+
+def test_reorder_candidates_for_prompt_cache_toxic_groups_by_key_stably() -> None:
+    candidates = [
+        (0, {"id": "a", "toxic": 1, "severe_toxic": 0, "obscene": 0, "threat": 0, "insult": 0, "identity_hate": 0}),
+        (1, {"id": "b", "toxic": 0, "severe_toxic": 0, "obscene": 0, "threat": 0, "insult": 0, "identity_hate": 0}),
+        (2, {"id": "c", "toxic": 1, "severe_toxic": 0, "obscene": 0, "threat": 0, "insult": 0, "identity_hate": 0}),
+        (3, {"id": "d", "toxic": 0, "severe_toxic": 0, "obscene": 1, "threat": 0, "insult": 0, "identity_hate": 0}),
+        (4, {"id": "e", "toxic": 0, "severe_toxic": 0, "obscene": 0, "threat": 0, "insult": 0, "identity_hate": 0}),
+    ]
+
+    reordered = reorder_candidates_for_prompt_cache("toxic", candidates)
+    assert [row["id"] for _, row in reordered] == ["a", "c", "b", "e", "d"]
+
+
+def test_reorder_candidates_for_prompt_cache_wildguard_groups_by_normalized_subcategories() -> None:
+    candidates = [
+        (0, {"id": "a", "subcategory": ["benign"]}),
+        (1, {"id": "b", "subcategory": ["cyberattack"]}),
+        (2, {"id": "c", "subcategory": ["benign"]}),
+        (3, {"id": "d", "subcategory": ["cyberattack", "benign"]}),
+        (4, {"id": "e", "subcategory": ["cyberattack"]}),
+    ]
+
+    reordered = reorder_candidates_for_prompt_cache("wildguard", candidates)
+    assert [row["id"] for _, row in reordered] == ["a", "c", "b", "e", "d"]

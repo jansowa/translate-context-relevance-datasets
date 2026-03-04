@@ -7,13 +7,17 @@ Currently supported:
 - `thesofakillers/jigsaw-toxic-comment-classification-challenge` (`toxic`, opt-in only)
 - `allenai/wildguardmix` (`wildguard`, opt-in only)
 
-The pipeline runs locally using **vLLM (OpenAI-compatible API)** and a separate **translator** container.
+The pipeline can run in two modes:
+- local mode with **vLLM (OpenAI-compatible API)**
+- external mode with any **OpenAI-compatible API** (for example OpenAI, Groq, OpenRouter)
+
+Both modes use the same translator container and OpenAI-compatible client.
 Results are written to JSONL, and progress is persisted with checkpoints so the process can be safely resumed.
 
 ## Requirements
 
 - Docker + Docker Compose
-- NVIDIA GPU (for vLLM) with a working GPU container runtime
+- NVIDIA GPU with a working GPU container runtime (required only for local vLLM mode)
 
 ## Configuration
 
@@ -25,7 +29,10 @@ cp .env.example .env
 
 Key variables in `.env`:
 
-- `MODEL_NAME` - model name served by vLLM
+- `MODEL_NAME` - model name used for translation (vLLM or external provider)
+- `INFERENCE_SOURCE` - translation backend: `vllm` (default) or `external`
+- `OPENAI_COMPAT_BASE_URL` - external OpenAI-compatible endpoint base URL (used in `external` mode)
+- `OPENAI_COMPAT_API_KEY` - external OpenAI-compatible API key (used in `external` mode)
 - `PARALLEL_REQUESTS` - number of parallel translation tasks on the translator side (`asyncio` + semaphore)
 - `PROGRESS_BAR` - translation progress display mode: `on` (default), `auto` (TTY only), `off`
 - `PROGRESS_METRIC` - progress metric for `tqdm`: `checkpoints` (default), `rows`, `both`
@@ -44,6 +51,8 @@ Available profiles:
 
 ## Running
 
+### Local vLLM mode
+
 1. Start vLLM:
 
 ```bash
@@ -54,6 +63,24 @@ docker compose up -d --build vllm
 
 ```bash
 docker compose run --rm translator
+```
+
+### External API mode (OpenAI-compatible)
+
+Set `INFERENCE_SOURCE=external` in `.env` and provide:
+- `OPENAI_COMPAT_BASE_URL`
+- `OPENAI_COMPAT_API_KEY`
+
+Then run translation without the vLLM dependency:
+
+```bash
+docker compose run --rm translator-external --inference-source external
+```
+
+Alternative (same service, skip dependencies explicitly):
+
+```bash
+docker compose run --rm --no-deps translator --inference-source external
 ```
 
 By default, the translator runs both context-relevance datasets sequentially (`nq` then `msmarco`).
@@ -111,10 +138,13 @@ Runtime behavior:
 
 ## Architecture
 
-`docker-compose.yml` starts two services:
+`docker-compose.yml` defines these services:
 
 - `vllm` - OpenAI-compatible endpoint at `http://vllm:8000/v1`
-- `translator` - client service that:
+- `translator` - client service (depends on `vllm`) for local mode
+- `translator-external` - client service without `vllm` dependency for external mode
+
+The translator service:
   - reads dataset rows,
   - translates queries and documents,
   - preserves output/checkpoint format compatible with the existing workflow,

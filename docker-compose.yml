@@ -57,3 +57,14 @@ services:
       - ./:/app
     working_dir: /app
     entrypoint: ["python", "run_translation_vllm.py"]
+
+  translator-external:
+    build:
+      context: .
+      dockerfile: Dockerfile.translator
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+    working_dir: /app
+    entrypoint: ["python", "run_translation_vllm.py"]

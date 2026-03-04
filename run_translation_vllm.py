@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import openai
@@ -110,7 +111,7 @@ def quiet_external_loggers() -> None:
 @dataclass
 class RowResult:
     rid: str
-    ckpt_path: str
+    ckpt_path: str | None
     out_row: dict[str, Any]
 
 
@@ -126,6 +127,46 @@ def _is_rate_limited(exc: BaseException) -> bool:
     if "rate limit" in msg or "quota" in msg:
         return True
     return False
+
+
+def _is_transient_llm_error(exc: BaseException) -> bool:
+    if _is_rate_limited(exc):
+        return True
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and status_code >= 500:
+        return True
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return True
+    msg = str(exc).lower()
+    transient_markers = (
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "server disconnected",
+        "service unavailable",
+        "internal server error",
+        "bad gateway",
+        "gateway timeout",
+    )
+    return any(marker in msg for marker in transient_markers)
+
+
+def _is_json_format_error(exc: BaseException) -> bool:
+    if isinstance(exc, json.JSONDecodeError):
+        return True
+    msg = str(exc).lower()
+    markers = (
+        "unterminated string",
+        "expecting value",
+        "invalid control character",
+        "extra data",
+        "failed to extract a complete json object",
+        "no '{' found in the model response",
+    )
+    return any(marker in msg for marker in markers)
 
 
 def checkpoint_is_complete(state: dict[str, Any], expected_texts: int) -> bool:
@@ -145,14 +186,6 @@ def checkpoint_is_complete(state: dict[str, Any], expected_texts: int) -> bool:
     if any(x is None for x in think_pl):
         return False
     return True
-
-
-def checkpoint_is_complete_toxic(state: dict[str, Any]) -> bool:
-    return bool(state.get("comment_text_pl"))
-
-
-def checkpoint_is_complete_wildguard(state: dict[str, Any]) -> bool:
-    return bool(state.get("prompt_pl"))
 
 
 def resolve_row_id(row: dict[str, Any], ds_idx: int, dataset_key: str) -> str:
@@ -178,6 +211,39 @@ def active_toxic_types_from_row(row: dict[str, Any]) -> list[str]:
     return active
 
 
+def row_cache_group_key(dataset_key: str, row: dict[str, Any]) -> tuple[str, ...] | None:
+    if dataset_key == "toxic":
+        return tuple(active_toxic_types_from_row(row))
+    if dataset_key == "wildguard":
+        return tuple(normalize_wildguard_subcategories(row.get("subcategory")))
+    return None
+
+
+def reorder_candidates_for_prompt_cache(
+    dataset_key: str,
+    candidates: list[tuple[int, dict[str, Any]]],
+) -> list[tuple[int, dict[str, Any]]]:
+    if dataset_key not in ("toxic", "wildguard"):
+        return candidates
+
+    # Stable grouping: keep first-seen group order and preserve order inside each group.
+    grouped: dict[tuple[str, ...], list[tuple[int, dict[str, Any]]]] = {}
+    ordered_keys: list[tuple[str, ...]] = []
+    for ds_idx, row in candidates:
+        key = row_cache_group_key(dataset_key, row)
+        if key is None:
+            return candidates
+        if key not in grouped:
+            grouped[key] = []
+            ordered_keys.append(key)
+        grouped[key].append((ds_idx, row))
+
+    reordered: list[tuple[int, dict[str, Any]]] = []
+    for key in ordered_keys:
+        reordered.extend(grouped[key])
+    return reordered
+
+
 def build_out_row_from_state(
     state: dict[str, Any],
     row: dict[str, Any],
@@ -195,6 +261,7 @@ def build_out_row_from_state(
         "labels": row["labels"],
         "think_process": state["think_process_pl"],
         "translation_model": state.get("active_model"),
+        "translation_source": getattr(args, "inference_source", "vllm"),
         "translation_key_last6": state.get("active_key_last6"),
         "translation_base_url": (args.base_url or None),
         "dataset_index": ds_idx,
@@ -224,6 +291,7 @@ def build_out_row_from_state_toxic(
         "comment_text": row["comment_text"],
         "comment_text_pl": state["comment_text_pl"],
         "translation_model": state.get("active_model"),
+        "translation_source": getattr(args, "inference_source", "vllm"),
         "translation_key_last6": state.get("active_key_last6"),
         "translation_base_url": (args.base_url or None),
         "dataset_index": ds_idx,
@@ -247,6 +315,7 @@ def build_out_row_from_state_wildguard(
             "source_dataset_hf": args.dataset,
             "prompt_pl": state["prompt_pl"],
             "translation_model": state.get("active_model"),
+            "translation_source": getattr(args, "inference_source", "vllm"),
             "translation_key_last6": state.get("active_key_last6"),
             "translation_base_url": (args.base_url or None),
             "dataset_index": ds_idx,
@@ -313,7 +382,14 @@ async def llm_call_json_async(
                 if "json_schema" in msg or "response_format" in msg:
                     schema_enabled = False
                     continue
-            await asyncio.sleep(min(60, (2 ** attempt) + random.random()))
+            if _is_json_format_error(e):
+                # Retry immediately on malformed JSON output from the model.
+                continue
+            if _is_transient_llm_error(e):
+                await asyncio.sleep(min(60, (2 ** attempt) + random.random()))
+                continue
+            # Non-transient errors are unlikely to improve with repeated attempts.
+            break
 
     raise RuntimeError(f"LLM call failed after retries: {last_err}") from last_err
 
@@ -387,7 +463,9 @@ async def translate_text_with_span_repair_async(
             build_text_prompt_dictforced(query_en, query_pl, doc_label, span_texts_en, spans_rel_i, think_process_en),
             schema_dict,
         ),
-    ][:max_attempts]
+    ]
+    effective_attempts = max(1, min(max_attempts, len(prompt_specs)))
+    prompt_specs = prompt_specs[:effective_attempts]
 
     last_problem = None
     for attempt_idx, (prompt, response_schema) in enumerate(prompt_specs, start=1):
@@ -567,6 +645,7 @@ async def process_row(
         "labels": row["labels"],
         "think_process": state["think_process_pl"],
         "translation_model": state.get("active_model"),
+        "translation_source": getattr(args, "inference_source", "vllm"),
         "translation_key_last6": state.get("active_key_last6"),
         "translation_base_url": (args.base_url or None),
         "dataset_index": ds_idx,
@@ -593,57 +672,43 @@ async def process_row_toxic(
     unit_done_callback: Callable[[int], None] | None = None,
 ) -> RowResult:
     rid = row["id"]
-    stem = checkpoint_stem_from_id(rid)
-    ckpt_path = os.path.join(args.checkpoint_dir, f"{stem}.json")
-
-    state = await asyncio.to_thread(read_json, ckpt_path) or {}
-    if not state:
-        state = {
-            "id": rid,
-            "comment_text_en": row["comment_text"],
-            "comment_text_pl": None,
-            "status": "in_progress",
-            "active_model": None,
-            "active_key_last6": None,
-            "dataset_index": ds_idx,
-        }
-        for label in TOXIC_LABEL_COLUMNS:
-            state[label] = int(row[label])
-        await asyncio.to_thread(write_json_atomic, ckpt_path, state)
-
-    if not state.get("comment_text_pl"):
-        active_toxic_types = active_toxic_types_from_row(row)
-        prompt = build_toxic_comment_prompt(
-            comment_text_en=row["comment_text"],
-            active_toxic_types=active_toxic_types,
-        )
-        schema = {
-            "type": "object",
-            "properties": {"comment_text_pl": {"type": "string"}},
-            "required": ["comment_text_pl"],
-            "additionalProperties": False,
-        }
-        translated_obj = await llm_call_json_async(
-            client=client,
-            model=args.model,
-            system_prompt=SYSTEM_TEXT_SIMPLE,
-            user_prompt=prompt,
-            temperature=args.temperature,
-            max_retries=args.max_retries,
-            delay_seconds=args.delay_seconds,
-            response_schema=schema,
-        )
-        state["comment_text_pl"] = (translated_obj.get("comment_text_pl") or "").strip()
-        if not state["comment_text_pl"]:
-            raise RuntimeError("Empty comment_text_pl from model")
-        state["active_model"] = args.model
-        state["active_key_last6"] = api_key_last6
-        await asyncio.to_thread(write_json_atomic, ckpt_path, state)
-        if unit_done_callback:
-            unit_done_callback(1)
+    state = {
+        "id": rid,
+        "comment_text_pl": None,
+        "active_model": None,
+        "active_key_last6": None,
+    }
+    active_toxic_types = active_toxic_types_from_row(row)
+    prompt = build_toxic_comment_prompt(
+        comment_text_en=row["comment_text"],
+        active_toxic_types=active_toxic_types,
+    )
+    schema = {
+        "type": "object",
+        "properties": {"comment_text_pl": {"type": "string"}},
+        "required": ["comment_text_pl"],
+        "additionalProperties": False,
+    }
+    translated_obj = await llm_call_json_async(
+        client=client,
+        model=args.model,
+        system_prompt=SYSTEM_TEXT_SIMPLE,
+        user_prompt=prompt,
+        temperature=args.temperature,
+        max_retries=args.max_retries,
+        delay_seconds=args.delay_seconds,
+        response_schema=schema,
+    )
+    state["comment_text_pl"] = (translated_obj.get("comment_text_pl") or "").strip()
+    if not state["comment_text_pl"]:
+        raise RuntimeError("Empty comment_text_pl from model")
+    state["active_model"] = args.model
+    state["active_key_last6"] = api_key_last6
+    if unit_done_callback:
+        unit_done_callback(1)
 
     out_row = build_out_row_from_state_toxic(state, row, ds_idx, args)
-    return RowResult(rid=rid, ckpt_path=ckpt_path, out_row=out_row)
+    return RowResult(rid=rid, ckpt_path=None, out_row=out_row)
 
 
 async def process_row_wildguard(
@@ -655,57 +720,43 @@ async def process_row_wildguard(
     unit_done_callback: Callable[[int], None] | None = None,
 ) -> RowResult:
     rid = resolve_row_id(row, ds_idx, args.dataset_key)
-    stem = checkpoint_stem_from_id(rid)
-    ckpt_path = os.path.join(args.checkpoint_dir, f"{stem}.json")
-
     subcategories = normalize_wildguard_subcategories(row.get("subcategory"))
-
-    state = await asyncio.to_thread(read_json, ckpt_path) or {}
-    if not state:
-        state = {
-            "id": rid,
-            "prompt_en": row["prompt"],
-            "prompt_pl": None,
-            "subcategories": subcategories,
-            "status": "in_progress",
-            "active_model": None,
-            "active_key_last6": None,
-            "dataset_index": ds_idx,
-        }
-        await asyncio.to_thread(write_json_atomic, ckpt_path, state)
-
-    if not state.get("prompt_pl"):
-        prompt = build_wildguard_prompt(
-            prompt_en=row["prompt"],
-            subcategories=subcategories,
-        )
-        schema = {
-            "type": "object",
-            "properties": {"prompt_pl": {"type": "string"}},
-            "required": ["prompt_pl"],
-            "additionalProperties": False,
-        }
-        translated_obj = await llm_call_json_async(
-            client=client,
-            model=args.model,
-            system_prompt=SYSTEM_TEXT_SIMPLE,
-            user_prompt=prompt,
-            temperature=args.temperature,
-            max_retries=args.max_retries,
-            delay_seconds=args.delay_seconds,
-            response_schema=schema,
-        )
-        state["prompt_pl"] = (translated_obj.get("prompt_pl") or "").strip()
-        if not state["prompt_pl"]:
-            raise RuntimeError("Empty prompt_pl from model")
-        state["active_model"] = args.model
-        state["active_key_last6"] = api_key_last6
-        await asyncio.to_thread(write_json_atomic, ckpt_path, state)
-        if unit_done_callback:
-            unit_done_callback(1)
+    state = {
+        "id": rid,
+        "prompt_pl": None,
+        "active_model": None,
+        "active_key_last6": None,
+    }
+    prompt = build_wildguard_prompt(
+        prompt_en=row["prompt"],
+        subcategories=subcategories,
+    )
+    schema = {
+        "type": "object",
+        "properties": {"prompt_pl": {"type": "string"}},
+        "required": ["prompt_pl"],
+        "additionalProperties": False,
+    }
+    translated_obj = await llm_call_json_async(
+        client=client,
+        model=args.model,
+        system_prompt=SYSTEM_TEXT_SIMPLE,
+        user_prompt=prompt,
+        temperature=args.temperature,
+        max_retries=args.max_retries,
+        delay_seconds=args.delay_seconds,
+        response_schema=schema,
+    )
+    state["prompt_pl"] = (translated_obj.get("prompt_pl") or "").strip()
+    if not state["prompt_pl"]:
+        raise RuntimeError("Empty prompt_pl from model")
+    state["active_model"] = args.model
+    state["active_key_last6"] = api_key_last6
+    if unit_done_callback:
+        unit_done_callback(1)
 
     out_row = build_out_row_from_state_wildguard(state, row, ds_idx, args)
-    return RowResult(rid=rid, ckpt_path=ckpt_path, out_row=out_row)
+    return RowResult(rid=rid, ckpt_path=None, out_row=out_row)
 
 
 async def writer_loop(
@@ -725,9 +776,10 @@ async def writer_loop(
                     await asyncio.to_thread(append_jsonl, out_jsonl, item.out_row)
                     done_ids.add(item.rid)
 
-                state = await asyncio.to_thread(read_json, item.ckpt_path) or {"id": item.rid}
-                state["status"] = "done"
-                await asyncio.to_thread(write_json_atomic, item.ckpt_path, state)
+                if item.ckpt_path:
+                    state = await asyncio.to_thread(read_json, item.ckpt_path) or {"id": item.rid}
+                    state["status"] = "done"
+                    await asyncio.to_thread(write_json_atomic, item.ckpt_path, state)
             finally:
                 q.task_done()
     except BaseException as exc:  # noqa: BLE001
@@ -737,17 +789,31 @@ async def writer_loop(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Translate dataset with checkpoints against OpenAI-compatible vLLM server."
+        description="Translate dataset with checkpoints against OpenAI-compatible API (local vLLM or external provider)."
     )
-    p.add_argument("--base-url", default=os.getenv("VLLM_BASE_URL", "http://vllm:8000/v1"))
-    p.add_argument("--api-key", default=os.getenv("OPENAI_API_KEY", "EMPTY"))
+    p.add_argument(
+        "--inference-source",
+        default=os.getenv("INFERENCE_SOURCE", "vllm"),
+        choices=["vllm", "external"],
+        help="API source mode: local vLLM or external OpenAI-compatible provider.",
+    )
+    p.add_argument(
+        "--base-url",
+        default=None,
+        help="Override API base URL. If omitted, resolves from mode-specific env vars.",
+    )
+    p.add_argument(
+        "--api-key",
+        default=None,
+        help="Override API key. If omitted, resolves from mode-specific env vars.",
+    )
     p.add_argument("--model", default=os.getenv("MODEL_NAME"), required=os.getenv("MODEL_NAME") is None)
     p.add_argument("--parallel-requests", type=int, default=int(os.getenv("PARALLEL_REQUESTS", "2")))
 
     p.add_argument("--delay-seconds", type=float, default=0.0)
     p.add_argument("--temperature", type=float, default=0.0)
-    p.add_argument("--max-retries", type=int, default=6)
-    p.add_argument("--max-prompt-attempts", type=int, default=4)
+    p.add_argument("--max-retries", type=int, default=1)
+    p.add_argument("--max-prompt-attempts", type=int, default=1)
     p.add_argument(
         "--fail-fast",
         action="store_true",
@@ -765,6 +831,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-dir", default="out_pl")
     p.add_argument("--out-jsonl-name", default="translated.jsonl")
     p.add_argument("--failed-jsonl-name", default="failed_rows.jsonl")
+    p.add_argument(
+        "--retry-failed-rows",
+        action="store_true",
+        help="Include rows previously present in failed_rows JSONL when resuming.",
+    )
     p.add_argument("--checkpoint-dir", default=None)
     p.add_argument("--max-rows", type=int, default=0, help="0 = all")
     p.add_argument("--skip-rows", type=int, default=0)
@@ -798,6 +869,37 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def resolve_api_connection(args: argparse.Namespace) -> tuple[str, str]:
+    if args.inference_source == "external":
+        base_url = (
+            args.base_url
+            or os.getenv("OPENAI_COMPAT_BASE_URL")
+            or os.getenv("EXTERNAL_OPENAI_BASE_URL")
+        )
+        api_key = (
+            args.api_key
+            or os.getenv("OPENAI_COMPAT_API_KEY")
+            or os.getenv("EXTERNAL_OPENAI_API_KEY")
+        )
+        if not base_url:
+            raise RuntimeError(
+                "External API mode requires base URL. Set OPENAI_COMPAT_BASE_URL (or EXTERNAL_OPENAI_BASE_URL) "
+                "or pass --base-url."
+            )
+        if not api_key:
+            raise RuntimeError(
+                "External API mode requires API key. Set OPENAI_COMPAT_API_KEY (or EXTERNAL_OPENAI_API_KEY) "
+                "or pass --api-key."
+            )
+        return base_url, api_key
+
+    base_url = args.base_url or os.getenv("VLLM_BASE_URL", "http://vllm:8000/v1")
+    api_key = args.api_key if args.api_key is not None else os.getenv("OPENAI_API_KEY", "EMPTY")
+    if not api_key:
+        api_key = "EMPTY"
+    return base_url, api_key
+
+
 def validate_dataset_schema(ds: Any, dataset_label: str, dataset_key: str) -> None:
     cols = set(getattr(ds, "column_names", []) or [])
     if dataset_key == "toxic":
@@ -829,15 +931,20 @@ def load_dataset_for_run(dataset_hf_id: str, dataset_key: str, split: str, hf_to
 
 
 async def run_single_dataset_async(args: argparse.Namespace) -> int:
-    if args.checkpoint_dir is None:
+    args.base_url, args.api_key = resolve_api_connection(args)
+    use_checkpoints = args.dataset_key not in ("toxic", "wildguard")
+
+    if use_checkpoints and args.checkpoint_dir is None:
         args.checkpoint_dir = os.path.join(args.out_dir, "checkpoints")
 
     os.makedirs(args.out_dir, exist_ok=True)
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    if use_checkpoints and args.checkpoint_dir:
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     out_jsonl = os.path.join(args.out_dir, args.out_jsonl_name)
     failed_jsonl = os.path.join(args.out_dir, args.failed_jsonl_name)
     done_ids = load_done_ids_from_jsonl(out_jsonl)
+    failed_ids = set() if args.retry_failed_rows else load_done_ids_from_jsonl(failed_jsonl)
 
     hf_token = os.getenv("HF_TOKEN") or None
     ds = load_dataset_for_run(args.dataset, args.dataset_key, args.split, hf_token)
@@ -853,6 +960,7 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
     end_idx = min(total, start_idx + int(args.max_rows)) if args.max_rows and args.max_rows > 0 else total
 
     recovered_from_ckpt = 0
+    skipped_failed = 0
     candidates_with_ckpt: list[tuple[int, dict[str, Any]]] = []
     candidates_fresh: list[tuple[int, dict[str, Any]]] = []
     for ds_idx in range(start_idx, end_idx):
@@ -860,29 +968,16 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
         rid = resolve_row_id(row, ds_idx, args.dataset_key)
         if rid in done_ids:
             continue
+        if rid in failed_ids:
+            skipped_failed += 1
+            continue
 
-        stem = checkpoint_stem_from_id(rid)
-        ckpt_path = os.path.join(args.checkpoint_dir, f"{stem}.json")
-        state = read_json(ckpt_path) or {}
+        if use_checkpoints:
+            stem = checkpoint_stem_from_id(rid)
+            ckpt_path = os.path.join(args.checkpoint_dir, f"{stem}.json")
+            state = read_json(ckpt_path) or {}
 
-        if state:
-            if args.dataset_key == "toxic":
-                if checkpoint_is_complete_toxic(state):
-                    append_jsonl(out_jsonl, build_out_row_from_state_toxic(state, row, ds_idx, args))
-                    done_ids.add(rid)
-                    state["status"] = "done"
-                    write_json_atomic(ckpt_path, state)
-                    recovered_from_ckpt += 1
-                    continue
-            elif args.dataset_key == "wildguard":
-                if checkpoint_is_complete_wildguard(state):
-                    append_jsonl(out_jsonl, build_out_row_from_state_wildguard(state, row, ds_idx, args))
-                    done_ids.add(rid)
-                    state["status"] = "done"
-                    write_json_atomic(ckpt_path, state)
-                    recovered_from_ckpt += 1
-                    continue
-            elif checkpoint_is_complete(state, expected_texts=len(row["texts"])):
+            if state and checkpoint_is_complete(state, expected_texts=len(row["texts"])):
                 append_jsonl(out_jsonl, build_out_row_from_state(state, row, ds_idx, args))
                 done_ids.add(rid)
                 state["status"] = "done"
@@ -890,29 +985,43 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
                 recovered_from_ckpt += 1
                 continue
 
-        if state:
-            candidates_with_ckpt.append((ds_idx, row))
+            if state:
+                candidates_with_ckpt.append((ds_idx, row))
+            else:
+                candidates_fresh.append((ds_idx, row))
         else:
             candidates_fresh.append((ds_idx, row))
 
+    candidates_with_ckpt = reorder_candidates_for_prompt_cache(args.dataset_key, candidates_with_ckpt)
+    candidates_fresh = reorder_candidates_for_prompt_cache(args.dataset_key, candidates_fresh)
     candidates = candidates_with_ckpt + candidates_fresh
 
     if not candidates:
-        print("Nothing to translate (all rows already done in selected window).")
+        if skipped_failed:
+            print(
+                "Nothing to translate (rows already done or skipped because they are present in failed_rows). "
+                "Use --retry-failed-rows to include failed rows."
+            )
+        else:
+            print("Nothing to translate (all rows already done in selected window).")
         return 0
 
     logging.info(
-        "Translation run: dataset_key=%s dataset=%s split=%s model=%s parallel=%d range=%d..%d total_in_range=%d pending=%d done_before=%d recovered_from_checkpoints=%d pending_with_checkpoints=%d pending_new=%d",
+        "Translation run: source=%s dataset_key=%s dataset=%s split=%s model=%s base_url=%s parallel=%d range=%d..%d total_in_range=%d pending=%d done_before=%d skipped_failed=%d retry_failed_rows=%s recovered_from_checkpoints=%d pending_with_checkpoints=%d pending_new=%d",
+        args.inference_source,
         args.dataset_key,
         args.dataset,
         args.split,
         args.model,
+        args.base_url,
         max(1, args.parallel_requests),
         start_idx,
         end_idx - 1,
         end_idx - start_idx,
         len(candidates),
         (end_idx - start_idx) - len(candidates),
+        skipped_failed,
+        bool(args.retry_failed_rows),
         recovered_from_ckpt,
         len(candidates_with_ckpt),
         len(candidates_fresh),
@@ -936,18 +1045,11 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
         row_units = 1 if args.dataset_key in ("toxic", "wildguard") else 1 + len(row["texts"])
         total_units += row_units
 
-        rid = resolve_row_id(row, ds_idx, args.dataset_key)
-        stem = checkpoint_stem_from_id(rid)
-        ckpt_path = os.path.join(args.checkpoint_dir, f"{stem}.json")
-        state = read_json(ckpt_path) or {}
-
-        if args.dataset_key == "toxic":
-            if state.get("comment_text_pl"):
-                done_units_before += 1
-        elif args.dataset_key == "wildguard":
-            if state.get("prompt_pl"):
-                done_units_before += 1
-        else:
+        if use_checkpoints:
+            rid = resolve_row_id(row, ds_idx, args.dataset_key)
+            stem = checkpoint_stem_from_id(rid)
+            ckpt_path = os.path.join(args.checkpoint_dir, f"{stem}.json")
+            state = read_json(ckpt_path) or {}
             if state.get("query_pl"):
                 done_units_before += 1
 
@@ -1050,7 +1152,7 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
                         }
                         await asyncio.to_thread(append_jsonl, failed_jsonl, failed_obj)
 
-                        if rid != "unknown":
+                        if use_checkpoints and rid != "unknown":
                             stem = checkpoint_stem_from_id(rid)
                             ckpt_path = os.path.join(args.checkpoint_dir, f"{stem}.json")
                             state = await asyncio.to_thread(read_json, ckpt_path) or {"id": rid, "dataset_index": ds_idx}
