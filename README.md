@@ -4,6 +4,7 @@ This repository provides a tool for translating context-relevance HuggingFace da
 Currently supported:
 - `zilliz/natural_questions-context-relevance-with-think` (`nq`)
 - `sentence-transformers/natural-questions` (`nq_qa`)
+- `sentence-transformers/hotpotqa` (`hotpotqa`)
 - `zilliz/msmarco-context-relevance-with-think` (`msmarco`)
 - `thesofakillers/jigsaw-toxic-comment-classification-challenge` (`toxic`, opt-in only)
 - `allenai/wildguardmix` (`wildguard`, opt-in only)
@@ -44,8 +45,9 @@ Key variables in `.env`:
 - `VLLM_MAX_NUM_BATCHED_TOKENS` (optional) - passed to `--max-num-batched-tokens` only when set
 - `VLLM_ENFORCE_EAGER` (optional) - if set to `1`, enables `--enforce-eager`
 - `HF_TOKEN` (optional/required for gated datasets) - Hugging Face token used by `load_dataset`
-- `FEW_SHOT_EXAMPLES_PATH` (optional) - path to CSV with EN->PL few-shot examples for `nq_qa`
-- `FEW_SHOT_EXAMPLE_COUNT` (optional) - number of random few-shot examples prepended for each `nq_qa` prompt (default: `3`)
+- `FEW_SHOT_EXAMPLES_PATH` (optional) - path to CSV with EN->PL few-shot examples for pair-style datasets (`nq_qa`, `hotpotqa`)
+- `FEW_SHOT_EXAMPLE_COUNT` (optional) - number of random few-shot examples prepended for each pair-style prompt (default: `3`)
+- `FEW_SHOT_SHARED_REQUESTS` (optional) - how many consecutive pair-style requests reuse the same sampled few-shot examples (default: `10`)
 
 Available profiles:
 
@@ -117,16 +119,17 @@ Optional offline tuning flags:
 
 By default, the translator runs both context-relevance datasets sequentially (`nq` then `msmarco`).
 The `toxic` and `wildguard` datasets are not included in `all` and run only when explicitly selected.
-The `nq_qa` dataset is also opt-in and keeps its own output folder to avoid collisions with the existing context-relevance `nq`.
+The `nq_qa` and `hotpotqa` datasets are also opt-in and keep their own output folders to avoid collisions with existing names.
 Use `--datasets` to limit the run:
 
 ```bash
 docker compose run --rm translator --datasets nq
 docker compose run --rm translator --datasets nq_qa
+docker compose run --rm translator --datasets hotpotqa
 docker compose run --rm translator --datasets msmarco
 docker compose run --rm translator --datasets toxic --split train
 docker compose run --rm translator --datasets wildguard --split train
-docker compose run --rm translator --datasets nq_qa toxic wildguard --split train
+docker compose run --rm translator --datasets nq_qa hotpotqa toxic wildguard --split train
 ```
 
 You can pass multiple dataset keys in one run; duplicates are ignored.
@@ -156,6 +159,7 @@ Output files are written inside the repository directory, in separate subfolders
 
 - `out_pl/nq/translated.jsonl`, `out_pl/nq/failed_rows.jsonl`, `out_pl/nq/checkpoints/*.json`
 - `out_pl/nq_qa/translated.jsonl`, `out_pl/nq_qa/failed_rows.jsonl`
+- `out_pl/hotpotqa/translated.jsonl`, `out_pl/hotpotqa/failed_rows.jsonl`
 - `out_pl/msmarco/translated.jsonl`, `out_pl/msmarco/failed_rows.jsonl`, `out_pl/msmarco/checkpoints/*.json`
 - `out_pl/toxic/translated.jsonl`, `out_pl/toxic/failed_rows.jsonl`, `out_pl/toxic/checkpoints/*.json`
 - `out_pl/wildguard/translated.jsonl`, `out_pl/wildguard/failed_rows.jsonl`, `out_pl/wildguard/checkpoints/*.json`
@@ -173,7 +177,9 @@ Runtime behavior:
 
 - the translator uses structured output (`response_format=json_schema` when supported, with fallback to `json_object`) to enforce translation shape
 - in offline vLLM mode, the translator also uses vLLM structured decoding (`structured_outputs`/`guided_decoding`) when available
-- for `nq_qa`, each request prepends 3 random few-shot EN->PL examples from [`prompt_examples/ms_marco_translation_examples.csv`](/c:/work/translate-context-relevance-datasets/prompt_examples/ms_marco_translation_examples.csv) by default
+- for `nq_qa` and `hotpotqa`, prompts reuse one sampled few-shot set for every 10 consecutive requests by default, with 3 random EN->PL examples from [`prompt_examples/ms_marco_translation_examples.csv`](/c:/work/translate-context-relevance-datasets/prompt_examples/ms_marco_translation_examples.csv)
+- for `hotpotqa`, only `anchor` and `positive` are translated; `negative` is copied through unchanged in English
+- `hotpotqa` is loaded with the default Hugging Face config `triplet`
 - row-level failures do not stop the whole run by default; they are logged to `<out-dir>/<dataset_key>/failed_rows.jsonl`
 - use `--fail-fast` to stop the entire run on the first failed row
 - use `--failed-jsonl-name <name>` to change the failed-rows file name

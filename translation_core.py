@@ -208,6 +208,13 @@ SYSTEM_NQ_QA = (
     "Keep keyword-style questions as keywords and natural questions as natural questions."
 )
 
+SYSTEM_PAIR_TRANSLATION = (
+    "You are an EN->PL translator for paired NLP data. Return ONLY valid JSON. "
+    "Do not add any comments or markdown. "
+    "Preserve meaning, punctuation, proper names, numbers, and casing. "
+    "Keep the two texts semantically aligned."
+)
+
 DEFAULT_FEW_SHOT_EXAMPLES_PATH = os.path.join(
     os.path.dirname(__file__),
     "prompt_examples",
@@ -499,29 +506,7 @@ def load_few_shot_translation_examples(csv_path: str) -> Tuple[Dict[str, str], .
     return tuple(cleaned)
 
 
-def _nq_qa_user_turn(question_en: str, answer_en: str) -> str:
-    return (
-        "### QUESTION (EN) ###\n"
-        f"{question_en}\n\n"
-        "### ANSWER (EN) ###\n"
-        f"{answer_en}\n\n"
-        "RESPONSE (JSON):"
-    )
-
-
-def _nq_qa_assistant_turn(question_pl: str, answer_pl: str) -> str:
-    return json.dumps(
-        {
-            "question_pl": question_pl,
-            "answer_pl": answer_pl,
-        },
-        ensure_ascii=False,
-    )
-
-
-def build_nq_qa_few_shot_messages(
-    question_en: str,
-    answer_en: str,
+def sample_few_shot_translation_examples(
     *,
     examples_path: str = DEFAULT_FEW_SHOT_EXAMPLES_PATH,
     example_count: int = 3,
@@ -533,26 +518,134 @@ def build_nq_qa_few_shot_messages(
         raise ValueError(
             f"Few-shot examples CSV contains {len(examples)} rows, but {example_count} are required"
         )
+    return random.sample(examples, example_count)
 
-    sampled = random.sample(examples, example_count)
+
+def _build_pair_user_turn(
+    left_label: str,
+    left_en: str,
+    right_label: str,
+    right_en: str,
+) -> str:
+    return (
+        f"### {left_label} (EN) ###\n"
+        f"{left_en}\n\n"
+        f"### {right_label} (EN) ###\n"
+        f"{right_en}\n\n"
+        "RESPONSE (JSON):"
+    )
+
+
+def _build_pair_assistant_turn(
+    left_pl_key: str,
+    left_pl: str,
+    right_pl_key: str,
+    right_pl: str,
+) -> str:
+    return json.dumps(
+        {
+            left_pl_key: left_pl,
+            right_pl_key: right_pl,
+        },
+        ensure_ascii=False,
+    )
+
+
+def build_pair_few_shot_messages(
+    left_en: str,
+    right_en: str,
+    *,
+    left_label: str,
+    right_label: str,
+    left_pl_key: str,
+    right_pl_key: str,
+    examples_path: str = DEFAULT_FEW_SHOT_EXAMPLES_PATH,
+    example_count: int = 3,
+    sampled_examples: List[Dict[str, str]] | None = None,
+) -> List[Dict[str, str]]:
+    sampled = (
+        list(sampled_examples)
+        if sampled_examples is not None
+        else sample_few_shot_translation_examples(
+            examples_path=examples_path,
+            example_count=example_count,
+        )
+    )
     messages: List[Dict[str, str]] = []
     for row in sampled:
         messages.append(
             {
                 "role": "user",
-                "content": _nq_qa_user_turn(row["query_text"], row["doc_text"]),
+                "content": _build_pair_user_turn(
+                    left_label,
+                    row["query_text"],
+                    right_label,
+                    row["doc_text"],
+                ),
             }
         )
         messages.append(
             {
                 "role": "assistant",
-                "content": _nq_qa_assistant_turn(row["phrase_pl"], row["document_pl"]),
+                "content": _build_pair_assistant_turn(
+                    left_pl_key,
+                    row["phrase_pl"],
+                    right_pl_key,
+                    row["document_pl"],
+                ),
             }
         )
     messages.append(
         {
             "role": "user",
-            "content": _nq_qa_user_turn(question_en, answer_en),
+            "content": _build_pair_user_turn(
+                left_label,
+                left_en,
+                right_label,
+                right_en,
+            ),
         }
     )
     return messages
+
+
+def build_nq_qa_few_shot_messages(
+    question_en: str,
+    answer_en: str,
+    *,
+    examples_path: str = DEFAULT_FEW_SHOT_EXAMPLES_PATH,
+    example_count: int = 3,
+    sampled_examples: List[Dict[str, str]] | None = None,
+) -> List[Dict[str, str]]:
+    return build_pair_few_shot_messages(
+        left_en=question_en,
+        right_en=answer_en,
+        left_label="QUESTION",
+        right_label="ANSWER",
+        left_pl_key="question_pl",
+        right_pl_key="answer_pl",
+        examples_path=examples_path,
+        example_count=example_count,
+        sampled_examples=sampled_examples,
+    )
+
+
+def build_hotpotqa_few_shot_messages(
+    anchor_en: str,
+    positive_en: str,
+    *,
+    examples_path: str = DEFAULT_FEW_SHOT_EXAMPLES_PATH,
+    example_count: int = 3,
+    sampled_examples: List[Dict[str, str]] | None = None,
+) -> List[Dict[str, str]]:
+    return build_pair_few_shot_messages(
+        left_en=anchor_en,
+        right_en=positive_en,
+        left_label="ANCHOR",
+        right_label="POSITIVE",
+        left_pl_key="anchor_pl",
+        right_pl_key="positive_pl",
+        examples_path=examples_path,
+        example_count=example_count,
+        sampled_examples=sampled_examples,
+    )

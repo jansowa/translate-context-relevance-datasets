@@ -22,6 +22,7 @@ from tqdm import tqdm
 
 from translation_core import (
     DEFAULT_FEW_SHOT_EXAMPLES_PATH,
+    SYSTEM_PAIR_TRANSLATION,
     SYSTEM_QUERY,
     SYSTEM_NQ_QA,
     SYSTEM_TEXT_SIMPLE,
@@ -30,6 +31,7 @@ from translation_core import (
     WILDGUARD_SUBCATEGORY_DESCRIPTIONS,
     RateLimitReached,
     append_jsonl,
+    build_hotpotqa_few_shot_messages,
     build_nq_qa_few_shot_messages,
     build_toxic_comment_prompt,
     build_wildguard_prompt,
@@ -41,6 +43,7 @@ from translation_core import (
     escape_control_chars_in_json_strings,
     extract_first_json_object,
     load_done_ids_from_jsonl,
+    sample_few_shot_translation_examples,
     read_json,
     rebuild_text_and_spans,
     normalize_wildguard_subcategories,
@@ -51,6 +54,7 @@ from translation_core import (
 DATASET_PRESETS: dict[str, str] = {
     "nq": "zilliz/natural_questions-context-relevance-with-think",
     "nq_qa": "sentence-transformers/natural-questions",
+    "hotpotqa": "sentence-transformers/hotpotqa",
     "msmarco": "zilliz/msmarco-context-relevance-with-think",
     "toxic": "thesofakillers/jigsaw-toxic-comment-classification-challenge",
     "wildguard": "allenai/wildguardmix",
@@ -78,6 +82,12 @@ REQUIRED_NQ_QA_PRIMARY_COLUMNS = (
     "answer",
 )
 
+REQUIRED_HOTPOTQA_COLUMNS = (
+    "anchor",
+    "positive",
+    "negative",
+)
+
 WILDGUARD_SUBCATEGORY_COLUMNS = tuple(WILDGUARD_SUBCATEGORY_DESCRIPTIONS.keys())
 
 REQUIRED_WILDGUARD_COLUMNS = (
@@ -89,6 +99,8 @@ WILDGUARD_CONFIG_BY_SPLIT = {
     "train": "wildguardtrain",
     "test": "wildguardtest",
 }
+
+HOTPOTQA_DEFAULT_CONFIG = "triplet"
 
 
 def format_seconds(seconds: float) -> str:
@@ -193,12 +205,13 @@ class OfflineVllmClient:
                 )
             except Exception:  # noqa: BLE001
                 pass
-        return (
-            "You are a chat assistant.\n"
-            f"[SYSTEM]\n{system_prompt}\n\n"
-            f"[USER]\n{user_prompt}\n\n"
-            "[ASSISTANT]\n"
-        )
+        rendered: list[str] = ["You are a chat assistant."]
+        for message in messages:
+            role = str(message.get("role", "user")).upper()
+            content = str(message.get("content", "") or "")
+            rendered.append(f"[{role}]\n{content}")
+        rendered.append("[ASSISTANT]\n")
+        return "\n\n".join(rendered)
 
     @property
     def supports_json_schema(self) -> bool:
@@ -570,6 +583,35 @@ def build_out_row_from_state_nq_qa(
     return out_row
 
 
+def build_out_row_from_state_hotpotqa(
+    state: dict[str, Any],
+    row: dict[str, Any],
+    ds_idx: int,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    out_row: dict[str, Any] = {
+        "id": state["id"],
+        "source_dataset": args.dataset_key,
+        "source_dataset_hf": args.dataset,
+        "anchor": state["anchor_pl"],
+        "positive": state["positive_pl"],
+        "negative": row["negative"],
+        "translation_model": state.get("active_model"),
+        "translation_source": getattr(args, "inference_source", "vllm"),
+        "translation_key_last6": state.get("active_key_last6"),
+        "translation_base_url": (args.base_url or None),
+        "dataset_index": ds_idx,
+    }
+    if args.keep_original_columns:
+        out_row.update(
+            {
+                "anchor_en": row["anchor"],
+                "positive_en": row["positive"],
+            }
+        )
+    return out_row
+
+
 def get_nq_qa_question_en(row: dict[str, Any]) -> str:
     question_en = row.get("question")
     if question_en is None:
@@ -578,6 +620,33 @@ def get_nq_qa_question_en(row: dict[str, Any]) -> str:
     if not question_en:
         raise RuntimeError("nq_qa row is missing a non-empty question/query value")
     return question_en
+
+
+def uses_grouped_few_shot_examples(dataset_key: str) -> bool:
+    return dataset_key in ("nq_qa", "hotpotqa")
+
+
+def build_shared_few_shot_examples_by_rid(
+    candidates: list[tuple[int, dict[str, Any]]],
+    dataset_key: str,
+    examples_path: str,
+    example_count: int,
+    shared_requests: int,
+) -> dict[str, list[dict[str, str]]]:
+    if not uses_grouped_few_shot_examples(dataset_key):
+        return {}
+
+    group_size = max(1, int(shared_requests))
+    examples_by_rid: dict[str, list[dict[str, str]]] = {}
+    for start in range(0, len(candidates), group_size):
+        sampled_examples = sample_few_shot_translation_examples(
+            examples_path=examples_path,
+            example_count=example_count,
+        )
+        for ds_idx, row in candidates[start : start + group_size]:
+            rid = resolve_row_id(row, ds_idx, dataset_key)
+            examples_by_rid[rid] = list(sampled_examples)
+    return examples_by_rid
 
 
 async def llm_call_json_async(
@@ -1042,6 +1111,7 @@ async def process_row_nq_qa(
 ) -> RowResult:
     rid = resolve_row_id(row, ds_idx, args.dataset_key)
     question_en = get_nq_qa_question_en(row)
+    sampled_examples = (getattr(args, "_few_shot_examples_by_rid", {}) or {}).get(rid)
     state = {
         "id": rid,
         "question_pl": None,
@@ -1054,6 +1124,7 @@ async def process_row_nq_qa(
         answer_en=row["answer"],
         examples_path=args.few_shot_examples_path,
         example_count=args.few_shot_example_count,
+        sampled_examples=sampled_examples,
     )
     schema = {
         "type": "object",
@@ -1087,6 +1158,65 @@ async def process_row_nq_qa(
         unit_done_callback(1)
 
     out_row = build_out_row_from_state_nq_qa(state, row, ds_idx, args)
+    return RowResult(rid=rid, ckpt_path=None, out_row=out_row)
+
+
+async def process_row_hotpotqa(
+    row: dict[str, Any],
+    ds_idx: int,
+    args: argparse.Namespace,
+    api_key_last6: str,
+    client: Any,
+    unit_done_callback: Callable[[int], None] | None = None,
+) -> RowResult:
+    rid = resolve_row_id(row, ds_idx, args.dataset_key)
+    sampled_examples = (getattr(args, "_few_shot_examples_by_rid", {}) or {}).get(rid)
+    state = {
+        "id": rid,
+        "anchor_pl": None,
+        "positive_pl": None,
+        "active_model": None,
+        "active_key_last6": None,
+    }
+    messages = build_hotpotqa_few_shot_messages(
+        anchor_en=row["anchor"],
+        positive_en=row["positive"],
+        examples_path=args.few_shot_examples_path,
+        example_count=args.few_shot_example_count,
+        sampled_examples=sampled_examples,
+    )
+    schema = {
+        "type": "object",
+        "properties": {
+            "anchor_pl": {"type": "string"},
+            "positive_pl": {"type": "string"},
+        },
+        "required": ["anchor_pl", "positive_pl"],
+        "additionalProperties": False,
+    }
+    translated_obj = await llm_call_json_async(
+        client=client,
+        model=args.model,
+        system_prompt=SYSTEM_PAIR_TRANSLATION,
+        user_prompt=None,
+        temperature=args.temperature,
+        max_retries=args.max_retries,
+        delay_seconds=args.delay_seconds,
+        response_schema=schema,
+        extra_messages=messages,
+    )
+    state["anchor_pl"] = (translated_obj.get("anchor_pl") or "").strip()
+    state["positive_pl"] = (translated_obj.get("positive_pl") or "").strip()
+    if not state["anchor_pl"]:
+        raise RuntimeError("Empty anchor_pl from model")
+    if not state["positive_pl"]:
+        raise RuntimeError("Empty positive_pl from model")
+    state["active_model"] = args.model
+    state["active_key_last6"] = api_key_last6
+    if unit_done_callback:
+        unit_done_callback(1)
+
+    out_row = build_out_row_from_state_hotpotqa(state, row, ds_idx, args)
     return RowResult(rid=rid, ckpt_path=None, out_row=out_row)
 
 
@@ -1204,13 +1334,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--few-shot-examples-path",
         default=os.getenv("FEW_SHOT_EXAMPLES_PATH", DEFAULT_FEW_SHOT_EXAMPLES_PATH),
-        help="CSV file with EN->PL few-shot examples used for the nq_qa dataset.",
+        help="CSV file with EN->PL few-shot examples used for pair-style datasets such as nq_qa and hotpotqa.",
     )
     p.add_argument(
         "--few-shot-example-count",
         type=int,
         default=int(os.getenv("FEW_SHOT_EXAMPLE_COUNT", "3")),
-        help="How many random few-shot examples to prepend for each nq_qa prompt.",
+        help="How many random few-shot examples to prepend for each pair-style prompt.",
+    )
+    p.add_argument(
+        "--few-shot-shared-requests",
+        type=int,
+        default=int(os.getenv("FEW_SHOT_SHARED_REQUESTS", "10")),
+        help="How many consecutive pair-style requests should reuse the same sampled few-shot examples.",
     )
     p.add_argument(
         "--fail-fast",
@@ -1222,7 +1358,7 @@ def parse_args() -> argparse.Namespace:
         "--datasets",
         nargs="+",
         default=["all"],
-        choices=["all", "nq", "nq_qa", "msmarco", "toxic", "wildguard"],
+        choices=["all", "nq", "nq_qa", "hotpotqa", "msmarco", "toxic", "wildguard"],
         help="Dataset selection: pass one or more keys. 'all' expands to NQ+MS MARCO.",
     )
     p.add_argument("--split", default="train", choices=["train", "validation", "test"])
@@ -1312,6 +1448,8 @@ def validate_dataset_schema(ds: Any, dataset_label: str, dataset_key: str) -> No
                 f"Dataset '{dataset_label}' is missing required question column. "
                 f"Expected one of: ['question', 'query']. Available columns: {sorted(cols)}"
             )
+    elif dataset_key == "hotpotqa":
+        required = REQUIRED_HOTPOTQA_COLUMNS
     elif dataset_key == "wildguard":
         required = REQUIRED_WILDGUARD_COLUMNS
     else:
@@ -1335,12 +1473,15 @@ def load_dataset_for_run(dataset_hf_id: str, dataset_key: str, split: str, hf_to
         # WildGuard uses config names for train/test variants; each config exposes a train split.
         return load_dataset(dataset_hf_id, name=config_name, split="train", token=hf_token)
 
+    if dataset_key == "hotpotqa":
+        return load_dataset(dataset_hf_id, name=HOTPOTQA_DEFAULT_CONFIG, split=split, token=hf_token)
+
     return load_dataset(dataset_hf_id, split=split, token=hf_token)
 
 
 async def run_single_dataset_async(args: argparse.Namespace) -> int:
     args.base_url, args.api_key = resolve_api_connection(args)
-    use_checkpoints = args.dataset_key not in ("toxic", "wildguard", "nq_qa")
+    use_checkpoints = args.dataset_key not in ("toxic", "wildguard", "nq_qa", "hotpotqa")
 
     if use_checkpoints and args.checkpoint_dir is None:
         args.checkpoint_dir = os.path.join(args.out_dir, "checkpoints")
@@ -1403,6 +1544,13 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
     candidates_with_ckpt = reorder_candidates_for_prompt_cache(args.dataset_key, candidates_with_ckpt)
     candidates_fresh = reorder_candidates_for_prompt_cache(args.dataset_key, candidates_fresh)
     candidates = candidates_with_ckpt + candidates_fresh
+    args._few_shot_examples_by_rid = build_shared_few_shot_examples_by_rid(
+        candidates=candidates,
+        dataset_key=args.dataset_key,
+        examples_path=args.few_shot_examples_path,
+        example_count=args.few_shot_example_count,
+        shared_requests=args.few_shot_shared_requests,
+    )
 
     if not candidates:
         if skipped_failed:
@@ -1439,6 +1587,13 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
         len(candidates_with_ckpt),
         len(candidates_fresh),
     )
+    if uses_grouped_few_shot_examples(args.dataset_key):
+        logging.info(
+            "Few-shot grouping: shared_requests=%d example_count=%d groups=%d",
+            int(args.few_shot_shared_requests),
+            int(args.few_shot_example_count),
+            (len(candidates) + max(1, int(args.few_shot_shared_requests)) - 1) // max(1, int(args.few_shot_shared_requests)),
+        )
 
     api_key_last6 = "OFFLINE" if args.inference_source == "offline" else (args.api_key[-6:] if args.api_key else "EMPTY")
     result_queue: asyncio.Queue[RowResult | None] = asyncio.Queue(
@@ -1455,7 +1610,7 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
     total_units = 0
     done_units_before = 0
     for ds_idx, row in candidates:
-        row_units = 1 if args.dataset_key in ("toxic", "wildguard", "nq_qa") else 1 + len(row["texts"])
+        row_units = 1 if args.dataset_key in ("toxic", "wildguard", "nq_qa", "hotpotqa") else 1 + len(row["texts"])
         total_units += row_units
 
         if use_checkpoints:
@@ -1536,6 +1691,8 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
                     return await process_row_toxic(row, ds_idx, args, api_key_last6, client, mark_units_done)
                 if args.dataset_key == "nq_qa":
                     return await process_row_nq_qa(row, ds_idx, args, api_key_last6, client, mark_units_done)
+                if args.dataset_key == "hotpotqa":
+                    return await process_row_hotpotqa(row, ds_idx, args, api_key_last6, client, mark_units_done)
                 if args.dataset_key == "wildguard":
                     return await process_row_wildguard(row, ds_idx, args, api_key_last6, client, mark_units_done)
                 return await process_row(row, ds_idx, args, api_key_last6, client, mark_units_done)

@@ -9,6 +9,7 @@ import pytest
 
 from translation_core import (
     append_jsonl,
+    build_hotpotqa_few_shot_messages,
     build_nq_qa_few_shot_messages,
     build_toxic_comment_prompt,
     build_wildguard_prompt,
@@ -42,6 +43,8 @@ if "tqdm" not in sys.modules:
 
 from run_translation_vllm import (  # noqa: E402
     TOXIC_LABEL_COLUMNS,
+    build_shared_few_shot_examples_by_rid,
+    build_out_row_from_state_hotpotqa,
     build_out_row_from_state_nq_qa,
     build_out_row_from_state_toxic,
     build_out_row_from_state_wildguard,
@@ -82,11 +85,26 @@ def test_parse_args_accepts_nq_qa_dataset(monkeypatch) -> None:
     assert args.datasets == ["nq_qa"]
 
 
+def test_parse_args_accepts_hotpotqa_dataset(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_NAME", "test-model")
+    monkeypatch.setattr(sys, "argv", ["prog", "--datasets", "hotpotqa"])
+    args = parse_args()
+    assert args.datasets == ["hotpotqa"]
+
+
+def test_parse_args_accepts_few_shot_shared_requests(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_NAME", "test-model")
+    monkeypatch.setattr(sys, "argv", ["prog", "--datasets", "nq_qa", "--few-shot-shared-requests", "10"])
+    args = parse_args()
+    assert args.few_shot_shared_requests == 10
+
+
 def test_selected_dataset_keys_all_excludes_toxic() -> None:
     assert selected_dataset_keys(["all"]) == ["nq", "msmarco"]
     assert selected_dataset_keys(["toxic"]) == ["toxic"]
     assert selected_dataset_keys(["wildguard"]) == ["wildguard"]
     assert selected_dataset_keys(["nq_qa"]) == ["nq_qa"]
+    assert selected_dataset_keys(["hotpotqa"]) == ["hotpotqa"]
 
 
 def test_parse_args_accepts_multiple_datasets(monkeypatch) -> None:
@@ -167,6 +185,24 @@ def test_load_dataset_for_run_maps_wildguard_test_to_config(monkeypatch) -> None
 def test_load_dataset_for_run_rejects_wildguard_validation() -> None:
     with pytest.raises(RuntimeError, match="does not support split='validation'"):
         load_dataset_for_run("allenai/wildguardmix", "wildguard", "validation", None)
+
+
+def test_load_dataset_for_run_maps_hotpotqa_to_default_triplet_config(monkeypatch) -> None:
+    called = {}
+
+    def fake_load_dataset(dataset_hf_id, **kwargs):
+        called["dataset_hf_id"] = dataset_hf_id
+        called["kwargs"] = kwargs
+        return "ok"
+
+    monkeypatch.setattr("run_translation_vllm.load_dataset", fake_load_dataset)
+
+    out = load_dataset_for_run("sentence-transformers/hotpotqa", "hotpotqa", "train", "hf_xxx")
+    assert out == "ok"
+    assert called["dataset_hf_id"] == "sentence-transformers/hotpotqa"
+    assert called["kwargs"]["name"] == "triplet"
+    assert called["kwargs"]["split"] == "train"
+    assert called["kwargs"]["token"] == "hf_xxx"
 
 
 def test_toxic_prompt_for_non_toxic_comment() -> None:
@@ -312,6 +348,27 @@ def test_nq_qa_output_row_accepts_query_alias_from_dataset() -> None:
     assert out["answer_en"] == "Amber urine is a dark yellow urine color."
 
 
+def test_hotpotqa_output_row_translates_anchor_and_positive_only() -> None:
+    row = {
+        "anchor": "who wrote the iliad",
+        "positive": "The Iliad is an ancient Greek epic poem attributed to Homer.",
+        "negative": "Paris is the capital city of France.",
+    }
+    state = {"id": "hp-1", "anchor_pl": "kto napisal Iliade", "positive_pl": "Iliada to starozytny grecki poemat epicki przypisywany Homerowi.", "active_model": "m3", "active_key_last6": "654321"}
+    args = argparse.Namespace(dataset_key="hotpotqa", dataset="sentence-transformers/hotpotqa", base_url=None, keep_original_columns=True)
+
+    out = build_out_row_from_state_hotpotqa(state, row, ds_idx=13, args=args)
+
+    assert out["anchor"] == "kto napisal Iliade"
+    assert out["positive"] == "Iliada to starozytny grecki poemat epicki przypisywany Homerowi."
+    assert out["negative"] == "Paris is the capital city of France."
+    assert out["anchor_en"] == "who wrote the iliad"
+    assert out["positive_en"] == "The Iliad is an ancient Greek epic poem attributed to Homer."
+    assert out["translation_model"] == "m3"
+    assert out["translation_key_last6"] == "654321"
+    assert out["dataset_index"] == 13
+
+
 def test_build_nq_qa_few_shot_messages_uses_three_examples_and_current_user(monkeypatch) -> None:
     tmp_dir = _make_test_dir()
     try:
@@ -350,6 +407,72 @@ def test_build_nq_qa_few_shot_messages_uses_three_examples_and_current_user(monk
         assert "target answer" in messages[-1]["content"]
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_build_hotpotqa_few_shot_messages_uses_anchor_and_positive_labels(monkeypatch) -> None:
+    tmp_dir = _make_test_dir()
+    try:
+        csv_path = os.path.join(tmp_dir, "fewshot.csv")
+        with open(csv_path, "w", encoding="utf-8", newline="") as f:
+            f.write(
+                "\n".join(
+                    [
+                        "query_text,phrase_pl,doc_text,document_pl",
+                        "q1,p1,d1,a1",
+                        "q2,p2,d2,a2",
+                        "q3,p3,d3,a3",
+                        "q4,p4,d4,a4",
+                    ]
+                )
+            )
+
+        monkeypatch.setattr("translation_core.random.sample", lambda seq, k: list(seq)[:k])
+
+        messages = build_hotpotqa_few_shot_messages(
+            anchor_en="target anchor",
+            positive_en="target positive",
+            examples_path=csv_path,
+            example_count=3,
+        )
+
+        assert len(messages) == 7
+        assert messages[0]["role"] == "user"
+        assert "ANCHOR (EN)" in messages[0]["content"]
+        assert "POSITIVE (EN)" in messages[0]["content"]
+        assert messages[1]["role"] == "assistant"
+        assert '"anchor_pl": "p1"' in messages[1]["content"]
+        assert '"positive_pl": "a1"' in messages[1]["content"]
+        assert messages[-1]["role"] == "user"
+        assert "target anchor" in messages[-1]["content"]
+        assert "target positive" in messages[-1]["content"]
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_build_shared_few_shot_examples_by_rid_reuses_examples_for_blocks_of_ten(monkeypatch) -> None:
+    calls = []
+
+    def fake_sample_few_shot_translation_examples(*, examples_path, example_count):
+        group_no = len(calls) + 1
+        calls.append((examples_path, example_count, group_no))
+        return [{"query_text": f"q{group_no}", "phrase_pl": f"p{group_no}", "doc_text": f"d{group_no}", "document_pl": f"a{group_no}"}]
+
+    monkeypatch.setattr("run_translation_vllm.sample_few_shot_translation_examples", fake_sample_few_shot_translation_examples)
+
+    candidates = [(idx, {"id": f"row-{idx}"}) for idx in range(23)]
+    out = build_shared_few_shot_examples_by_rid(
+        candidates=candidates,
+        dataset_key="nq_qa",
+        examples_path="examples.csv",
+        example_count=3,
+        shared_requests=10,
+    )
+
+    assert len(calls) == 3
+    assert out["row-0"] == out["row-9"]
+    assert out["row-10"] == out["row-19"]
+    assert out["row-0"] != out["row-10"]
+    assert out["row-20"] == out["row-22"]
 
 
 def test_resume_ids_loaded_from_toxic_jsonl() -> None:
