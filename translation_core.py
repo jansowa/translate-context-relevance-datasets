@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import csv
 import hashlib
 import json
 import os
+import random
 import re
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -196,6 +199,19 @@ SYSTEM_TEXT_SIMPLE = (
     "You are an EN->PL translator for NLP data. Return ONLY valid JSON. "
     "Do not add any comments or markdown. "
     "Preserve meaning, intent, proper names, numbers, and quotations."
+)
+
+SYSTEM_NQ_QA = (
+    "You are an EN->PL translator for question-answer NLP data. Return ONLY valid JSON. "
+    "Do not add any comments or markdown. "
+    "Preserve meaning, punctuation, proper names, numbers, and casing. "
+    "Keep keyword-style questions as keywords and natural questions as natural questions."
+)
+
+DEFAULT_FEW_SHOT_EXAMPLES_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "prompt_examples",
+    "ms_marco_translation_examples.csv",
 )
 
 TOXIC_LABEL_DESCRIPTIONS: dict[str, str] = {
@@ -453,3 +469,90 @@ def build_text_prompt_dictforced(
         "THINK_PROCESS (EN):\n"
         f"{think_process_en}"
     )
+
+
+@lru_cache(maxsize=None)
+def load_few_shot_translation_examples(csv_path: str) -> Tuple[Dict[str, str], ...]:
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        rows = tuple(csv.DictReader(f))
+
+    required = ("query_text", "phrase_pl", "doc_text", "document_pl")
+    if not rows:
+        raise ValueError(f"Few-shot examples CSV is empty: {csv_path}")
+
+    missing = [name for name in required if name not in rows[0]]
+    if missing:
+        raise ValueError(
+            f"Few-shot examples CSV is missing required columns: {missing}. "
+            f"Expected columns: {list(required)}"
+        )
+
+    cleaned: list[Dict[str, str]] = []
+    for idx, row in enumerate(rows, start=1):
+        example = {name: (row.get(name) or "").strip() for name in required}
+        empty = [name for name, value in example.items() if not value]
+        if empty:
+            raise ValueError(
+                f"Few-shot examples CSV row {idx} has empty required columns: {empty}"
+            )
+        cleaned.append(example)
+    return tuple(cleaned)
+
+
+def _nq_qa_user_turn(question_en: str, answer_en: str) -> str:
+    return (
+        "### QUESTION (EN) ###\n"
+        f"{question_en}\n\n"
+        "### ANSWER (EN) ###\n"
+        f"{answer_en}\n\n"
+        "RESPONSE (JSON):"
+    )
+
+
+def _nq_qa_assistant_turn(question_pl: str, answer_pl: str) -> str:
+    return json.dumps(
+        {
+            "question_pl": question_pl,
+            "answer_pl": answer_pl,
+        },
+        ensure_ascii=False,
+    )
+
+
+def build_nq_qa_few_shot_messages(
+    question_en: str,
+    answer_en: str,
+    *,
+    examples_path: str = DEFAULT_FEW_SHOT_EXAMPLES_PATH,
+    example_count: int = 3,
+) -> List[Dict[str, str]]:
+    examples = list(load_few_shot_translation_examples(examples_path))
+    if example_count <= 0:
+        raise ValueError("Few-shot example count must be positive")
+    if len(examples) < example_count:
+        raise ValueError(
+            f"Few-shot examples CSV contains {len(examples)} rows, but {example_count} are required"
+        )
+
+    sampled = random.sample(examples, example_count)
+    messages: List[Dict[str, str]] = []
+    for row in sampled:
+        messages.append(
+            {
+                "role": "user",
+                "content": _nq_qa_user_turn(row["query_text"], row["doc_text"]),
+            }
+        )
+        messages.append(
+            {
+                "role": "assistant",
+                "content": _nq_qa_assistant_turn(row["phrase_pl"], row["document_pl"]),
+            }
+        )
+    messages.append(
+        {
+            "role": "user",
+            "content": _nq_qa_user_turn(question_en, answer_en),
+        }
+    )
+    return messages

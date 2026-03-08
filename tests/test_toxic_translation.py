@@ -1,11 +1,15 @@
 import argparse
+import os
+import shutil
 import sys
 import types
+import uuid
 
 import pytest
 
 from translation_core import (
     append_jsonl,
+    build_nq_qa_few_shot_messages,
     build_toxic_comment_prompt,
     build_wildguard_prompt,
     load_done_ids_from_jsonl,
@@ -38,6 +42,7 @@ if "tqdm" not in sys.modules:
 
 from run_translation_vllm import (  # noqa: E402
     TOXIC_LABEL_COLUMNS,
+    build_out_row_from_state_nq_qa,
     build_out_row_from_state_toxic,
     build_out_row_from_state_wildguard,
     load_dataset_for_run,
@@ -48,6 +53,12 @@ from run_translation_vllm import (  # noqa: E402
     row_cache_group_key,
     selected_dataset_keys,
 )
+
+
+def _make_test_dir() -> str:
+    path = os.path.join(os.getcwd(), f".test_tmp_{uuid.uuid4().hex}")
+    os.makedirs(path, exist_ok=False)
+    return path
 
 
 def test_parse_args_accepts_toxic_dataset(monkeypatch) -> None:
@@ -64,10 +75,18 @@ def test_parse_args_accepts_wildguard_dataset(monkeypatch) -> None:
     assert args.datasets == ["wildguard"]
 
 
+def test_parse_args_accepts_nq_qa_dataset(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_NAME", "test-model")
+    monkeypatch.setattr(sys, "argv", ["prog", "--datasets", "nq_qa"])
+    args = parse_args()
+    assert args.datasets == ["nq_qa"]
+
+
 def test_selected_dataset_keys_all_excludes_toxic() -> None:
     assert selected_dataset_keys(["all"]) == ["nq", "msmarco"]
     assert selected_dataset_keys(["toxic"]) == ["toxic"]
     assert selected_dataset_keys(["wildguard"]) == ["wildguard"]
+    assert selected_dataset_keys(["nq_qa"]) == ["nq_qa"]
 
 
 def test_parse_args_accepts_multiple_datasets(monkeypatch) -> None:
@@ -258,18 +277,101 @@ def test_wildguard_output_row_contains_original_data_and_prompt_pl() -> None:
     assert out["dataset_index"] == 3
 
 
-def test_resume_ids_loaded_from_toxic_jsonl(tmp_path) -> None:
-    out_path = tmp_path / "translated.jsonl"
-    append_jsonl(str(out_path), {"id": "toxic-row-1", "comment_text_pl": "ok"})
-    done_ids = load_done_ids_from_jsonl(str(out_path))
-    assert "toxic-row-1" in done_ids
+def test_nq_qa_output_row_contains_translations_and_optional_originals() -> None:
+    row = {
+        "question": "What is amber urine?",
+        "answer": "Amber urine is a dark yellow urine color.",
+    }
+    state = {"id": "nqqa-1", "question_pl": "Co to jest bursztynowy mocz?", "answer_pl": "Bursztynowy mocz to ciemnozolty kolor moczu.", "active_model": "m2", "active_key_last6": "fedcba"}
+    args = argparse.Namespace(dataset_key="nq_qa", dataset="sentence-transformers/natural-questions", base_url=None, keep_original_columns=True)
+
+    out = build_out_row_from_state_nq_qa(state, row, ds_idx=11, args=args)
+
+    assert out["id"] == "nqqa-1"
+    assert out["question"] == "Co to jest bursztynowy mocz?"
+    assert out["answer"] == "Bursztynowy mocz to ciemnozolty kolor moczu."
+    assert out["question_en"] == "What is amber urine?"
+    assert out["answer_en"] == "Amber urine is a dark yellow urine color."
+    assert out["translation_model"] == "m2"
+    assert out["translation_key_last6"] == "fedcba"
+    assert out["translation_base_url"] is None
+    assert out["dataset_index"] == 11
 
 
-def test_resume_ids_loaded_from_wildguard_jsonl(tmp_path) -> None:
-    out_path = tmp_path / "translated.jsonl"
-    append_jsonl(str(out_path), {"id": "wg-row-1", "prompt_pl": "ok"})
-    done_ids = load_done_ids_from_jsonl(str(out_path))
-    assert "wg-row-1" in done_ids
+def test_nq_qa_output_row_accepts_query_alias_from_dataset() -> None:
+    row = {
+        "query": "What is amber urine?",
+        "answer": "Amber urine is a dark yellow urine color.",
+    }
+    state = {"id": "nqqa-2", "question_pl": "Co to jest bursztynowy mocz?", "answer_pl": "Bursztynowy mocz to ciemnozolty kolor moczu."}
+    args = argparse.Namespace(dataset_key="nq_qa", dataset="sentence-transformers/natural-questions", base_url=None, keep_original_columns=True)
+
+    out = build_out_row_from_state_nq_qa(state, row, ds_idx=12, args=args)
+
+    assert out["question_en"] == "What is amber urine?"
+    assert out["answer_en"] == "Amber urine is a dark yellow urine color."
+
+
+def test_build_nq_qa_few_shot_messages_uses_three_examples_and_current_user(monkeypatch) -> None:
+    tmp_dir = _make_test_dir()
+    try:
+        csv_path = os.path.join(tmp_dir, "fewshot.csv")
+        with open(csv_path, "w", encoding="utf-8", newline="") as f:
+            f.write(
+                "\n".join(
+                    [
+                        "query_text,phrase_pl,doc_text,document_pl",
+                        "q1,p1,d1,a1",
+                        "q2,p2,d2,a2",
+                        "q3,p3,d3,a3",
+                        "q4,p4,d4,a4",
+                    ]
+                )
+            )
+
+        monkeypatch.setattr("translation_core.random.sample", lambda seq, k: list(seq)[:k])
+
+        messages = build_nq_qa_few_shot_messages(
+            question_en="target question",
+            answer_en="target answer",
+            examples_path=csv_path,
+            example_count=3,
+        )
+
+        assert len(messages) == 7
+        assert messages[0]["role"] == "user"
+        assert "QUESTION (EN)" in messages[0]["content"]
+        assert "q1" in messages[0]["content"]
+        assert messages[1]["role"] == "assistant"
+        assert '"question_pl": "p1"' in messages[1]["content"]
+        assert '"answer_pl": "a1"' in messages[1]["content"]
+        assert messages[-1]["role"] == "user"
+        assert "target question" in messages[-1]["content"]
+        assert "target answer" in messages[-1]["content"]
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_resume_ids_loaded_from_toxic_jsonl() -> None:
+    tmp_dir = _make_test_dir()
+    try:
+        out_path = os.path.join(tmp_dir, "translated.jsonl")
+        append_jsonl(out_path, {"id": "toxic-row-1", "comment_text_pl": "ok"})
+        done_ids = load_done_ids_from_jsonl(out_path)
+        assert "toxic-row-1" in done_ids
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_resume_ids_loaded_from_wildguard_jsonl() -> None:
+    tmp_dir = _make_test_dir()
+    try:
+        out_path = os.path.join(tmp_dir, "translated.jsonl")
+        append_jsonl(out_path, {"id": "wg-row-1", "prompt_pl": "ok"})
+        done_ids = load_done_ids_from_jsonl(out_path)
+        assert "wg-row-1" in done_ids
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def test_resolve_row_id_for_wildguard_without_source_id_is_stable() -> None:

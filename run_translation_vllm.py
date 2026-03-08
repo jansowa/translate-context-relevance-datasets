@@ -21,13 +21,16 @@ from openai import AsyncOpenAI
 from tqdm import tqdm
 
 from translation_core import (
+    DEFAULT_FEW_SHOT_EXAMPLES_PATH,
     SYSTEM_QUERY,
+    SYSTEM_NQ_QA,
     SYSTEM_TEXT_SIMPLE,
     SYSTEM_TEXT,
     TOXIC_LABEL_DESCRIPTIONS,
     WILDGUARD_SUBCATEGORY_DESCRIPTIONS,
     RateLimitReached,
     append_jsonl,
+    build_nq_qa_few_shot_messages,
     build_toxic_comment_prompt,
     build_wildguard_prompt,
     build_text_prompt,
@@ -47,6 +50,7 @@ from translation_core import (
 
 DATASET_PRESETS: dict[str, str] = {
     "nq": "zilliz/natural_questions-context-relevance-with-think",
+    "nq_qa": "sentence-transformers/natural-questions",
     "msmarco": "zilliz/msmarco-context-relevance-with-think",
     "toxic": "thesofakillers/jigsaw-toxic-comment-classification-challenge",
     "wildguard": "allenai/wildguardmix",
@@ -68,6 +72,10 @@ REQUIRED_TOXIC_COLUMNS = (
     "id",
     "comment_text",
     *TOXIC_LABEL_COLUMNS,
+)
+
+REQUIRED_NQ_QA_PRIMARY_COLUMNS = (
+    "answer",
 )
 
 WILDGUARD_SUBCATEGORY_COLUMNS = tuple(WILDGUARD_SUBCATEGORY_DESCRIPTIONS.keys())
@@ -173,11 +181,7 @@ class OfflineVllmClient:
                 "JSON schema enforcement is disabled for offline mode."
             )
 
-    def _render_chat_prompt(self, system_prompt: str, user_prompt: str) -> str:
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
+    def _render_chat_prompt(self, messages: list[dict[str, str]]) -> str:
         if self._tokenizer is not None and hasattr(self._tokenizer, "apply_chat_template"):
             try:
                 return str(
@@ -286,15 +290,14 @@ class OfflineVllmClient:
     async def chat_completion_content(
         self,
         *,
-        system_prompt: str,
-        user_prompt: str,
+        messages: list[dict[str, str]],
         temperature: float,
         response_schema: dict[str, Any] | None = None,
     ) -> str:
         await self._ensure_worker_started()
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[str] = loop.create_future()
-        prompt = self._render_chat_prompt(system_prompt, user_prompt)
+        prompt = self._render_chat_prompt(messages)
         await self._queue.put(
             {
                 "prompt": prompt,
@@ -312,6 +315,21 @@ class OfflineVllmClient:
         await self._queue.join()
         await self._worker_task
         self._worker_task = None
+
+
+def build_chat_messages(
+    system_prompt: str,
+    user_prompt: str | None = None,
+    extra_messages: list[dict[str, str]] | None = None,
+) -> list[dict[str, str]]:
+    messages = [{"role": "system", "content": system_prompt}]
+    if extra_messages:
+        messages.extend(extra_messages)
+    elif user_prompt is not None:
+        messages.append({"role": "user", "content": user_prompt})
+    else:
+        raise ValueError("Either user_prompt or extra_messages must be provided")
+    return messages
 
 
 def _is_rate_limited(exc: BaseException) -> bool:
@@ -523,27 +541,71 @@ def build_out_row_from_state_wildguard(
     return out_row
 
 
+def build_out_row_from_state_nq_qa(
+    state: dict[str, Any],
+    row: dict[str, Any],
+    ds_idx: int,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    question_en = get_nq_qa_question_en(row)
+    out_row: dict[str, Any] = {
+        "id": state["id"],
+        "source_dataset": args.dataset_key,
+        "source_dataset_hf": args.dataset,
+        "question": state["question_pl"],
+        "answer": state["answer_pl"],
+        "translation_model": state.get("active_model"),
+        "translation_source": getattr(args, "inference_source", "vllm"),
+        "translation_key_last6": state.get("active_key_last6"),
+        "translation_base_url": (args.base_url or None),
+        "dataset_index": ds_idx,
+    }
+    if args.keep_original_columns:
+        out_row.update(
+            {
+                "question_en": question_en,
+                "answer_en": row["answer"],
+            }
+        )
+    return out_row
+
+
+def get_nq_qa_question_en(row: dict[str, Any]) -> str:
+    question_en = row.get("question")
+    if question_en is None:
+        question_en = row.get("query")
+    question_en = str(question_en or "").strip()
+    if not question_en:
+        raise RuntimeError("nq_qa row is missing a non-empty question/query value")
+    return question_en
+
+
 async def llm_call_json_async(
     client: Any,
     model: str,
     system_prompt: str,
-    user_prompt: str,
+    user_prompt: str | None,
     temperature: float,
     max_retries: int,
     delay_seconds: float,
     response_schema: dict[str, Any] | None = None,
+    extra_messages: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     last_err: BaseException | None = None
     schema_enabled = response_schema is not None
     if isinstance(client, OfflineVllmClient) and response_schema is not None and not client.supports_json_schema:
         schema_enabled = False
+    messages = build_chat_messages(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        extra_messages=extra_messages,
+    )
 
     for attempt in range(max_retries):
         try:
             if isinstance(client, OfflineVllmClient):
                 content = await client.chat_completion_content(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
+                    messages=messages,
                     temperature=temperature,
                     response_schema=response_schema if schema_enabled else None,
                 )
@@ -551,10 +613,7 @@ async def llm_call_json_async(
                 kwargs = dict(
                     model=model,
                     temperature=temperature,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
+                    messages=messages,
                 )
 
                 if schema_enabled and response_schema is not None:
@@ -973,6 +1032,64 @@ async def process_row_wildguard(
     return RowResult(rid=rid, ckpt_path=None, out_row=out_row)
 
 
+async def process_row_nq_qa(
+    row: dict[str, Any],
+    ds_idx: int,
+    args: argparse.Namespace,
+    api_key_last6: str,
+    client: Any,
+    unit_done_callback: Callable[[int], None] | None = None,
+) -> RowResult:
+    rid = resolve_row_id(row, ds_idx, args.dataset_key)
+    question_en = get_nq_qa_question_en(row)
+    state = {
+        "id": rid,
+        "question_pl": None,
+        "answer_pl": None,
+        "active_model": None,
+        "active_key_last6": None,
+    }
+    messages = build_nq_qa_few_shot_messages(
+        question_en=question_en,
+        answer_en=row["answer"],
+        examples_path=args.few_shot_examples_path,
+        example_count=args.few_shot_example_count,
+    )
+    schema = {
+        "type": "object",
+        "properties": {
+            "question_pl": {"type": "string"},
+            "answer_pl": {"type": "string"},
+        },
+        "required": ["question_pl", "answer_pl"],
+        "additionalProperties": False,
+    }
+    translated_obj = await llm_call_json_async(
+        client=client,
+        model=args.model,
+        system_prompt=SYSTEM_NQ_QA,
+        user_prompt=None,
+        temperature=args.temperature,
+        max_retries=args.max_retries,
+        delay_seconds=args.delay_seconds,
+        response_schema=schema,
+        extra_messages=messages,
+    )
+    state["question_pl"] = (translated_obj.get("question_pl") or "").strip()
+    state["answer_pl"] = (translated_obj.get("answer_pl") or "").strip()
+    if not state["question_pl"]:
+        raise RuntimeError("Empty question_pl from model")
+    if not state["answer_pl"]:
+        raise RuntimeError("Empty answer_pl from model")
+    state["active_model"] = args.model
+    state["active_key_last6"] = api_key_last6
+    if unit_done_callback:
+        unit_done_callback(1)
+
+    out_row = build_out_row_from_state_nq_qa(state, row, ds_idx, args)
+    return RowResult(rid=rid, ckpt_path=None, out_row=out_row)
+
+
 async def writer_loop(
     q: asyncio.Queue[RowResult | None],
     out_jsonl: str,
@@ -1085,6 +1202,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-retries", type=int, default=1)
     p.add_argument("--max-prompt-attempts", type=int, default=1)
     p.add_argument(
+        "--few-shot-examples-path",
+        default=os.getenv("FEW_SHOT_EXAMPLES_PATH", DEFAULT_FEW_SHOT_EXAMPLES_PATH),
+        help="CSV file with EN->PL few-shot examples used for the nq_qa dataset.",
+    )
+    p.add_argument(
+        "--few-shot-example-count",
+        type=int,
+        default=int(os.getenv("FEW_SHOT_EXAMPLE_COUNT", "3")),
+        help="How many random few-shot examples to prepend for each nq_qa prompt.",
+    )
+    p.add_argument(
         "--fail-fast",
         action="store_true",
         help="Stop whole run on first row-level translation error.",
@@ -1094,7 +1222,7 @@ def parse_args() -> argparse.Namespace:
         "--datasets",
         nargs="+",
         default=["all"],
-        choices=["all", "nq", "msmarco", "toxic", "wildguard"],
+        choices=["all", "nq", "nq_qa", "msmarco", "toxic", "wildguard"],
         help="Dataset selection: pass one or more keys. 'all' expands to NQ+MS MARCO.",
     )
     p.add_argument("--split", default="train", choices=["train", "validation", "test"])
@@ -1177,6 +1305,13 @@ def validate_dataset_schema(ds: Any, dataset_label: str, dataset_key: str) -> No
     cols = set(getattr(ds, "column_names", []) or [])
     if dataset_key == "toxic":
         required = REQUIRED_TOXIC_COLUMNS
+    elif dataset_key == "nq_qa":
+        required = REQUIRED_NQ_QA_PRIMARY_COLUMNS
+        if "question" not in cols and "query" not in cols:
+            raise RuntimeError(
+                f"Dataset '{dataset_label}' is missing required question column. "
+                f"Expected one of: ['question', 'query']. Available columns: {sorted(cols)}"
+            )
     elif dataset_key == "wildguard":
         required = REQUIRED_WILDGUARD_COLUMNS
     else:
@@ -1205,7 +1340,7 @@ def load_dataset_for_run(dataset_hf_id: str, dataset_key: str, split: str, hf_to
 
 async def run_single_dataset_async(args: argparse.Namespace) -> int:
     args.base_url, args.api_key = resolve_api_connection(args)
-    use_checkpoints = args.dataset_key not in ("toxic", "wildguard")
+    use_checkpoints = args.dataset_key not in ("toxic", "wildguard", "nq_qa")
 
     if use_checkpoints and args.checkpoint_dir is None:
         args.checkpoint_dir = os.path.join(args.out_dir, "checkpoints")
@@ -1320,7 +1455,7 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
     total_units = 0
     done_units_before = 0
     for ds_idx, row in candidates:
-        row_units = 1 if args.dataset_key in ("toxic", "wildguard") else 1 + len(row["texts"])
+        row_units = 1 if args.dataset_key in ("toxic", "wildguard", "nq_qa") else 1 + len(row["texts"])
         total_units += row_units
 
         if use_checkpoints:
@@ -1399,6 +1534,8 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
             async with sem:
                 if args.dataset_key == "toxic":
                     return await process_row_toxic(row, ds_idx, args, api_key_last6, client, mark_units_done)
+                if args.dataset_key == "nq_qa":
+                    return await process_row_nq_qa(row, ds_idx, args, api_key_last6, client, mark_units_done)
                 if args.dataset_key == "wildguard":
                     return await process_row_wildguard(row, ds_idx, args, api_key_last6, client, mark_units_done)
                 return await process_row(row, ds_idx, args, api_key_last6, client, mark_units_done)
