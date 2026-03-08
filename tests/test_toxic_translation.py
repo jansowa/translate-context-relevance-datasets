@@ -43,6 +43,7 @@ from run_translation_vllm import (  # noqa: E402
     load_dataset_for_run,
     parse_args,
     reorder_candidates_for_prompt_cache,
+    resolve_api_connection,
     resolve_row_id,
     row_cache_group_key,
     selected_dataset_keys,
@@ -74,6 +75,35 @@ def test_parse_args_accepts_multiple_datasets(monkeypatch) -> None:
     monkeypatch.setattr(sys, "argv", ["prog", "--datasets", "toxic", "wildguard"])
     args = parse_args()
     assert args.datasets == ["toxic", "wildguard"]
+
+
+def test_parse_args_accepts_offline_inference_source(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_NAME", "test-model")
+    monkeypatch.setattr(sys, "argv", ["prog", "--inference-source", "offline", "--datasets", "nq"])
+    args = parse_args()
+    assert args.inference_source == "offline"
+
+
+def test_parse_args_accepts_offline_micro_batch_size(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_NAME", "test-model")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["prog", "--inference-source", "offline", "--offline-micro-batch-size", "150", "--datasets", "nq"],
+    )
+    args = parse_args()
+    assert args.offline_micro_batch_size == 150
+
+
+def test_resolve_api_connection_offline_requires_no_base_url_or_key() -> None:
+    args = argparse.Namespace(
+        inference_source="offline",
+        base_url=None,
+        api_key=None,
+    )
+    base_url, api_key = resolve_api_connection(args)
+    assert base_url is None
+    assert api_key is None
 
 
 def test_selected_dataset_keys_expands_all_and_deduplicates() -> None:

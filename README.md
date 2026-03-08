@@ -7,11 +7,12 @@ Currently supported:
 - `thesofakillers/jigsaw-toxic-comment-classification-challenge` (`toxic`, opt-in only)
 - `allenai/wildguardmix` (`wildguard`, opt-in only)
 
-The pipeline can run in two modes:
+The pipeline can run in three modes:
 - local mode with **vLLM (OpenAI-compatible API)**
 - external mode with any **OpenAI-compatible API** (for example OpenAI, Groq, OpenRouter)
+- local mode with **vLLM offline inference** (no API server)
 
-Both modes use the same translator container and OpenAI-compatible client.
+All modes use the same translator script and output/checkpoint format.
 Results are written to JSONL, and progress is persisted with checkpoints so the process can be safely resumed.
 
 ## Requirements
@@ -30,7 +31,7 @@ cp .env.example .env
 Key variables in `.env`:
 
 - `MODEL_NAME` - model name used for translation (vLLM or external provider)
-- `INFERENCE_SOURCE` - translation backend: `vllm` (default) or `external`
+- `INFERENCE_SOURCE` - translation backend: `vllm` (default), `external`, or `offline`
 - `OPENAI_COMPAT_BASE_URL` - external OpenAI-compatible endpoint base URL (used in `external` mode)
 - `OPENAI_COMPAT_API_KEY` - external OpenAI-compatible API key (used in `external` mode)
 - `PARALLEL_REQUESTS` - number of parallel translation tasks on the translator side (`asyncio` + semaphore)
@@ -83,6 +84,34 @@ Alternative (same service, skip dependencies explicitly):
 docker compose run --rm --no-deps translator --inference-source external
 ```
 
+### Offline vLLM mode (no server)
+
+Use this mode when you want to run translation directly through the vLLM Python engine (offline inference), fully via Docker Compose.
+
+Build and run:
+
+```bash
+docker compose build translator-offline
+docker compose run --rm translator-offline --datasets nq --split train
+```
+
+Example:
+
+```bash
+docker compose run --rm translator-offline --datasets toxic --split train
+```
+
+Optional offline tuning flags:
+- `--offline-tensor-parallel-size`
+- `--offline-gpu-memory-utilization`
+- `--offline-max-model-len`
+- `--offline-max-num-seqs`
+- `--offline-max-num-batched-tokens`
+- `--offline-enforce-eager`
+- `--offline-dtype`
+- `--offline-max-output-tokens`
+- `--offline-micro-batch-size` (default: `150`)
+
 By default, the translator runs both context-relevance datasets sequentially (`nq` then `msmarco`).
 The `toxic` and `wildguard` datasets are not included in `all` and run only when explicitly selected.
 Use `--datasets` to limit the run:
@@ -129,9 +158,15 @@ You can resume processing by running the translator again with the same paramete
 Already completed records are skipped.
 For correct interactive `tqdm` rendering, run the translator with `docker compose run --rm translator`.
 
+Resume behavior after interruption:
+- for context-relevance datasets (`nq`, `msmarco`), checkpoints are written after query translation and after every translated text in a row
+- if the script is interrupted, rerun with the same arguments and it continues from the last completed checkpoint unit
+- completed rows are deduplicated by `id` in output JSONL, so resumed runs do not re-append finished records
+
 Runtime behavior:
 
 - the translator uses structured output (`response_format=json_schema` when supported, with fallback to `json_object`) to enforce translation shape
+- in offline vLLM mode, the translator also uses vLLM structured decoding (`structured_outputs`/`guided_decoding`) when available
 - row-level failures do not stop the whole run by default; they are logged to `<out-dir>/<dataset_key>/failed_rows.jsonl`
 - use `--fail-fast` to stop the entire run on the first failed row
 - use `--failed-jsonl-name <name>` to change the failed-rows file name
@@ -143,6 +178,9 @@ Runtime behavior:
 - `vllm` - OpenAI-compatible endpoint at `http://vllm:8000/v1`
 - `translator` - client service (depends on `vllm`) for local mode
 - `translator-external` - client service without `vllm` dependency for external mode
+- `translator-offline` - translator running vLLM offline inference in-process (no API server dependency)
+
+`vllm` and `translator-offline` share model/cache volumes (`hf-cache`, `vllm-cache`), so model files are downloaded once and reused by both services.
 
 The translator service:
   - reads dataset rows,

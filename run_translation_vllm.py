@@ -12,6 +12,7 @@ import random
 import sys
 import time
 import copy
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -113,6 +114,204 @@ class RowResult:
     rid: str
     ckpt_path: str | None
     out_row: dict[str, Any]
+
+
+class OfflineVllmClient:
+    def __init__(self, args: argparse.Namespace) -> None:
+        try:
+            from vllm import LLM, SamplingParams
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "Offline mode requires the 'vllm' package in the current Python environment."
+            ) from exc
+
+        structured_outputs_cls = None
+        guided_decoding_cls = None
+        try:
+            from vllm.sampling_params import StructuredOutputsParams as _StructuredOutputsParams
+
+            structured_outputs_cls = _StructuredOutputsParams
+        except Exception:  # noqa: BLE001
+            structured_outputs_cls = None
+        try:
+            from vllm.sampling_params import GuidedDecodingParams as _GuidedDecodingParams
+
+            guided_decoding_cls = _GuidedDecodingParams
+        except Exception:  # noqa: BLE001
+            guided_decoding_cls = None
+
+        llm_kwargs: dict[str, Any] = {
+            "model": args.model,
+            "tensor_parallel_size": max(1, int(args.offline_tensor_parallel_size)),
+            "dtype": args.offline_dtype,
+            "gpu_memory_utilization": float(args.offline_gpu_memory_utilization),
+        }
+        if int(args.offline_max_model_len) > 0:
+            llm_kwargs["max_model_len"] = int(args.offline_max_model_len)
+        if int(args.offline_max_num_seqs) > 0:
+            llm_kwargs["max_num_seqs"] = int(args.offline_max_num_seqs)
+        if int(args.offline_max_num_batched_tokens) > 0:
+            llm_kwargs["max_num_batched_tokens"] = int(args.offline_max_num_batched_tokens)
+        if args.offline_enforce_eager:
+            llm_kwargs["enforce_eager"] = True
+
+        self._SamplingParams = SamplingParams
+        self._StructuredOutputsParams = structured_outputs_cls
+        self._GuidedDecodingParams = guided_decoding_cls
+        self._llm = LLM(**llm_kwargs)
+        self._max_output_tokens = max(64, int(args.offline_max_output_tokens))
+        self._micro_batch_size = max(1, int(args.offline_micro_batch_size))
+        tokenizer_getter = getattr(self._llm, "get_tokenizer", None)
+        self._tokenizer = tokenizer_getter() if callable(tokenizer_getter) else None
+        self._queue: asyncio.Queue[Any] = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
+        self._stop_sentinel = object()
+        self._supports_json_schema = self._StructuredOutputsParams is not None or self._GuidedDecodingParams is not None
+        if not self._supports_json_schema:
+            logging.warning(
+                "Offline vLLM structured output params are unavailable in this vLLM build; "
+                "JSON schema enforcement is disabled for offline mode."
+            )
+
+    def _render_chat_prompt(self, system_prompt: str, user_prompt: str) -> str:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        if self._tokenizer is not None and hasattr(self._tokenizer, "apply_chat_template"):
+            try:
+                return str(
+                    self._tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        return (
+            "You are a chat assistant.\n"
+            f"[SYSTEM]\n{system_prompt}\n\n"
+            f"[USER]\n{user_prompt}\n\n"
+            "[ASSISTANT]\n"
+        )
+
+    @property
+    def supports_json_schema(self) -> bool:
+        return self._supports_json_schema
+
+    def _sampling_params_for_request(self, temperature: float, response_schema: dict[str, Any] | None) -> Any:
+        kwargs: dict[str, Any] = {
+            "temperature": float(temperature),
+            "top_p": 1.0,
+            "max_tokens": self._max_output_tokens,
+        }
+        if response_schema and self._supports_json_schema:
+            if self._StructuredOutputsParams is not None:
+                kwargs["structured_outputs"] = self._StructuredOutputsParams(json=response_schema)
+            elif self._GuidedDecodingParams is not None:
+                kwargs["guided_decoding"] = self._GuidedDecodingParams(json=response_schema)
+        return self._SamplingParams(**kwargs)
+
+    def _generate_batch_once(
+        self,
+        prompts: list[str],
+        temperatures: list[float],
+        response_schemas: list[dict[str, Any] | None],
+    ) -> list[str]:
+        sampling_params_list = [
+            self._sampling_params_for_request(temp, schema)
+            for temp, schema in zip(temperatures, response_schemas)
+        ]
+        outputs = self._llm.generate(prompts, sampling_params_list, use_tqdm=False)
+        if len(outputs) != len(prompts):
+            raise RuntimeError(
+                f"Offline vLLM returned {len(outputs)} outputs for {len(prompts)} prompts"
+            )
+
+        out_texts: list[str] = []
+        for output in outputs:
+            candidates = getattr(output, "outputs", None) or []
+            if not candidates:
+                raise RuntimeError("Offline vLLM returned empty candidate list")
+            out_texts.append(str(getattr(candidates[0], "text", "") or ""))
+        return out_texts
+
+    async def _ensure_worker_started(self) -> None:
+        if self._worker_task is None:
+            self._worker_task = asyncio.create_task(self._batch_worker())
+
+    async def _batch_worker(self) -> None:
+        while True:
+            item = await self._queue.get()
+            if item is self._stop_sentinel:
+                self._queue.task_done()
+                return
+
+            batch = [item]
+            # Small coalescing window to form larger micro-batches.
+            while len(batch) < self._micro_batch_size:
+                try:
+                    nxt = await asyncio.wait_for(self._queue.get(), timeout=0.01)
+                except asyncio.TimeoutError:
+                    break
+                if nxt is self._stop_sentinel:
+                    await self._queue.put(self._stop_sentinel)
+                    break
+                batch.append(nxt)
+
+            prompts = [req["prompt"] for req in batch]
+            temperatures = [req["temperature"] for req in batch]
+            response_schemas = [req.get("response_schema") for req in batch]
+            futures = [req["future"] for req in batch]
+            try:
+                contents = await asyncio.to_thread(
+                    self._generate_batch_once,
+                    prompts,
+                    temperatures,
+                    response_schemas,
+                )
+            except Exception as exc:  # noqa: BLE001
+                for fut in futures:
+                    if not fut.done():
+                        fut.set_exception(exc)
+            else:
+                for fut, content in zip(futures, contents):
+                    if not fut.done():
+                        fut.set_result(content)
+            finally:
+                for _ in batch:
+                    self._queue.task_done()
+
+    async def chat_completion_content(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+        response_schema: dict[str, Any] | None = None,
+    ) -> str:
+        await self._ensure_worker_started()
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[str] = loop.create_future()
+        prompt = self._render_chat_prompt(system_prompt, user_prompt)
+        await self._queue.put(
+            {
+                "prompt": prompt,
+                "temperature": float(temperature),
+                "response_schema": response_schema,
+                "future": fut,
+            }
+        )
+        return await fut
+
+    async def aclose(self) -> None:
+        if self._worker_task is None:
+            return
+        await self._queue.put(self._stop_sentinel)
+        await self._queue.join()
+        await self._worker_task
+        self._worker_task = None
 
 
 def _is_rate_limited(exc: BaseException) -> bool:
@@ -325,7 +524,7 @@ def build_out_row_from_state_wildguard(
 
 
 async def llm_call_json_async(
-    client: AsyncOpenAI,
+    client: Any,
     model: str,
     system_prompt: str,
     user_prompt: str,
@@ -336,31 +535,41 @@ async def llm_call_json_async(
 ) -> dict[str, Any]:
     last_err: BaseException | None = None
     schema_enabled = response_schema is not None
+    if isinstance(client, OfflineVllmClient) and response_schema is not None and not client.supports_json_schema:
+        schema_enabled = False
 
     for attempt in range(max_retries):
         try:
-            kwargs = dict(
-                model=model,
-                temperature=temperature,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            )
-
-            if schema_enabled and response_schema is not None:
-                kwargs["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "translation_response",
-                        "schema": response_schema,
-                    },
-                }
+            if isinstance(client, OfflineVllmClient):
+                content = await client.chat_completion_content(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    temperature=temperature,
+                    response_schema=response_schema if schema_enabled else None,
+                )
             else:
-                kwargs["response_format"] = {"type": "json_object"}
+                kwargs = dict(
+                    model=model,
+                    temperature=temperature,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                )
 
-            resp = await client.chat.completions.create(**kwargs)
-            content = resp.choices[0].message.content or ""
+                if schema_enabled and response_schema is not None:
+                    kwargs["response_format"] = {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "translation_response",
+                            "schema": response_schema,
+                        },
+                    }
+                else:
+                    kwargs["response_format"] = {"type": "json_object"}
+
+                resp = await client.chat.completions.create(**kwargs)
+                content = resp.choices[0].message.content or ""
 
             try:
                 obj = extract_first_json_object(content)
@@ -380,6 +589,11 @@ async def llm_call_json_async(
             if schema_enabled:
                 msg = str(e).lower()
                 if "json_schema" in msg or "response_format" in msg:
+                    schema_enabled = False
+                    continue
+                if isinstance(client, OfflineVllmClient) and (
+                    "structured_outputs" in msg or "guided_decoding" in msg
+                ):
                     schema_enabled = False
                     continue
             if _is_json_format_error(e):
@@ -522,7 +736,7 @@ async def process_row(
     ds_idx: int,
     args: argparse.Namespace,
     api_key_last6: str,
-    client: AsyncOpenAI,
+    client: Any,
     unit_done_callback: Callable[[int], None] | None = None,
 ) -> RowResult:
     rid = row["id"]
@@ -668,7 +882,7 @@ async def process_row_toxic(
     ds_idx: int,
     args: argparse.Namespace,
     api_key_last6: str,
-    client: AsyncOpenAI,
+    client: Any,
     unit_done_callback: Callable[[int], None] | None = None,
 ) -> RowResult:
     rid = row["id"]
@@ -716,7 +930,7 @@ async def process_row_wildguard(
     ds_idx: int,
     args: argparse.Namespace,
     api_key_last6: str,
-    client: AsyncOpenAI,
+    client: Any,
     unit_done_callback: Callable[[int], None] | None = None,
 ) -> RowResult:
     rid = resolve_row_id(row, ds_idx, args.dataset_key)
@@ -789,13 +1003,16 @@ async def writer_loop(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Translate dataset with checkpoints against OpenAI-compatible API (local vLLM or external provider)."
+        description=(
+            "Translate dataset with checkpoints against OpenAI-compatible API "
+            "(local vLLM server or external provider) or vLLM offline inference."
+        )
     )
     p.add_argument(
         "--inference-source",
         default=os.getenv("INFERENCE_SOURCE", "vllm"),
-        choices=["vllm", "external"],
-        help="API source mode: local vLLM or external OpenAI-compatible provider.",
+        choices=["vllm", "external", "offline"],
+        help="Inference source: local vLLM API server, external OpenAI-compatible API, or offline vLLM engine.",
     )
     p.add_argument(
         "--base-url",
@@ -809,6 +1026,59 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--model", default=os.getenv("MODEL_NAME"), required=os.getenv("MODEL_NAME") is None)
     p.add_argument("--parallel-requests", type=int, default=int(os.getenv("PARALLEL_REQUESTS", "2")))
+    p.add_argument(
+        "--offline-tensor-parallel-size",
+        type=int,
+        default=int(os.getenv("OFFLINE_TENSOR_PARALLEL_SIZE", os.getenv("GPU_COUNT", "1"))),
+        help="Offline mode only: vLLM tensor parallel size.",
+    )
+    p.add_argument(
+        "--offline-gpu-memory-utilization",
+        type=float,
+        default=float(os.getenv("OFFLINE_GPU_MEMORY_UTILIZATION", os.getenv("GPU_MEMORY_UTILIZATION", "0.9"))),
+        help="Offline mode only: vLLM GPU memory utilization.",
+    )
+    p.add_argument(
+        "--offline-max-model-len",
+        type=int,
+        default=int(os.getenv("OFFLINE_MAX_MODEL_LEN", os.getenv("MAX_MODEL_LEN", "0"))),
+        help="Offline mode only: max model length. 0 means vLLM default.",
+    )
+    p.add_argument(
+        "--offline-max-num-seqs",
+        type=int,
+        default=int(os.getenv("OFFLINE_MAX_NUM_SEQS", "0")),
+        help="Offline mode only: set vLLM max_num_seqs. 0 means default.",
+    )
+    p.add_argument(
+        "--offline-max-num-batched-tokens",
+        type=int,
+        default=int(os.getenv("OFFLINE_MAX_NUM_BATCHED_TOKENS", "0")),
+        help="Offline mode only: set vLLM max_num_batched_tokens. 0 means default.",
+    )
+    p.add_argument(
+        "--offline-enforce-eager",
+        action="store_true",
+        default=os.getenv("OFFLINE_ENFORCE_EAGER", "0") == "1",
+        help="Offline mode only: enable vLLM enforce_eager.",
+    )
+    p.add_argument(
+        "--offline-dtype",
+        default=os.getenv("OFFLINE_DTYPE", "auto"),
+        help="Offline mode only: vLLM dtype (for example auto, float16, bfloat16).",
+    )
+    p.add_argument(
+        "--offline-max-output-tokens",
+        type=int,
+        default=int(os.getenv("OFFLINE_MAX_OUTPUT_TOKENS", "2048")),
+        help="Offline mode only: max generated tokens per LLM call.",
+    )
+    p.add_argument(
+        "--offline-micro-batch-size",
+        type=int,
+        default=int(os.getenv("OFFLINE_MICRO_BATCH_SIZE", "150")),
+        help="Offline mode only: target micro-batch size for in-process vLLM generate().",
+    )
 
     p.add_argument("--delay-seconds", type=float, default=0.0)
     p.add_argument("--temperature", type=float, default=0.0)
@@ -869,7 +1139,10 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def resolve_api_connection(args: argparse.Namespace) -> tuple[str, str]:
+def resolve_api_connection(args: argparse.Namespace) -> tuple[str | None, str | None]:
+    if args.inference_source == "offline":
+        return None, None
+
     if args.inference_source == "external":
         base_url = (
             args.base_url
@@ -1006,15 +1279,20 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
             print("Nothing to translate (all rows already done in selected window).")
         return 0
 
+    effective_parallel = max(1, args.parallel_requests)
+    if args.inference_source == "offline":
+        effective_parallel = max(effective_parallel, int(args.offline_micro_batch_size))
+
     logging.info(
-        "Translation run: source=%s dataset_key=%s dataset=%s split=%s model=%s base_url=%s parallel=%d range=%d..%d total_in_range=%d pending=%d done_before=%d skipped_failed=%d retry_failed_rows=%s recovered_from_checkpoints=%d pending_with_checkpoints=%d pending_new=%d",
+        "Translation run: source=%s dataset_key=%s dataset=%s split=%s model=%s base_url=%s parallel=%d offline_micro_batch=%d range=%d..%d total_in_range=%d pending=%d done_before=%d skipped_failed=%d retry_failed_rows=%s recovered_from_checkpoints=%d pending_with_checkpoints=%d pending_new=%d",
         args.inference_source,
         args.dataset_key,
         args.dataset,
         args.split,
         args.model,
         args.base_url,
-        max(1, args.parallel_requests),
+        effective_parallel,
+        int(args.offline_micro_batch_size),
         start_idx,
         end_idx - 1,
         end_idx - start_idx,
@@ -1027,7 +1305,7 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
         len(candidates_fresh),
     )
 
-    api_key_last6 = args.api_key[-6:] if args.api_key else "EMPTY"
+    api_key_last6 = "OFFLINE" if args.inference_source == "offline" else (args.api_key[-6:] if args.api_key else "EMPTY")
     result_queue: asyncio.Queue[RowResult | None] = asyncio.Queue(
         maxsize=max(4, args.parallel_requests * 2)
     )
@@ -1101,9 +1379,22 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
         completed_units += increment
         pbar_units.update(increment)
 
-    sem = asyncio.Semaphore(max(1, args.parallel_requests))
+    sem = asyncio.Semaphore(effective_parallel)
 
-    async with AsyncOpenAI(api_key=args.api_key, base_url=args.base_url) as client:
+    @asynccontextmanager
+    async def build_inference_client():
+        if args.inference_source == "offline":
+            offline_client = OfflineVllmClient(args)
+            try:
+                yield offline_client
+            finally:
+                await offline_client.aclose()
+            return
+
+        async with AsyncOpenAI(api_key=args.api_key, base_url=args.base_url) as api_client:
+            yield api_client
+
+    async with build_inference_client() as client:
         async def process_with_limit(ds_idx: int, row: dict[str, Any]) -> RowResult:
             async with sem:
                 if args.dataset_key == "toxic":
