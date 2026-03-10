@@ -106,6 +106,16 @@ Example:
 docker compose run --rm translator-offline --datasets toxic --split train
 ```
 
+QA answer relevance scoring on already translated Polish files:
+
+```bash
+docker compose run --rm qa-relevance-offline --datasets nq_qa hotpotqa
+```
+
+This reads `out_pl/<dataset>/translated.jsonl` and writes `out_pl/<dataset>/answer_relevance.jsonl`.
+The output row keeps the original translated record and adds an `answer_relevance` object with `explanation` and `label`.
+Completed rows are skipped on resume, so you can stop the run and continue later.
+
 Optional offline tuning flags:
 - `--offline-tensor-parallel-size`
 - `--offline-gpu-memory-utilization`
@@ -159,7 +169,9 @@ Output files are written inside the repository directory, in separate subfolders
 
 - `out_pl/nq/translated.jsonl`, `out_pl/nq/failed_rows.jsonl`, `out_pl/nq/checkpoints/*.json`
 - `out_pl/nq_qa/translated.jsonl`, `out_pl/nq_qa/failed_rows.jsonl`
+- `out_pl/nq_qa/answer_relevance.jsonl`, `out_pl/nq_qa/answer_relevance_failed_rows.jsonl`
 - `out_pl/hotpotqa/translated.jsonl`, `out_pl/hotpotqa/failed_rows.jsonl`
+- `out_pl/hotpotqa/answer_relevance.jsonl`, `out_pl/hotpotqa/answer_relevance_failed_rows.jsonl`
 - `out_pl/msmarco/translated.jsonl`, `out_pl/msmarco/failed_rows.jsonl`, `out_pl/msmarco/checkpoints/*.json`
 - `out_pl/toxic/translated.jsonl`, `out_pl/toxic/failed_rows.jsonl`, `out_pl/toxic/checkpoints/*.json`
 - `out_pl/wildguard/translated.jsonl`, `out_pl/wildguard/failed_rows.jsonl`, `out_pl/wildguard/checkpoints/*.json`
@@ -183,6 +195,8 @@ Runtime behavior:
 - row-level failures do not stop the whole run by default; they are logged to `<out-dir>/<dataset_key>/failed_rows.jsonl`
 - use `--fail-fast` to stop the entire run on the first failed row
 - use `--failed-jsonl-name <name>` to change the failed-rows file name
+- answer relevance scoring is available for `nq_qa` and `hotpotqa`; it reads translated Polish JSONL files and adds an `answer_relevance` object with structured output fields ordered as `explanation`, then `label`
+- use `qa-relevance`, `qa-relevance-external`, or `qa-relevance-offline` services for the QA scoring stage
 
 ## Architecture
 
@@ -192,6 +206,9 @@ Runtime behavior:
 - `translator` - client service (depends on `vllm`) for local mode
 - `translator-external` - client service without `vllm` dependency for external mode
 - `translator-offline` - translator running vLLM offline inference in-process (no API server dependency)
+- `qa-relevance` - answer relevance scorer using the local `vllm` server
+- `qa-relevance-external` - answer relevance scorer against an external OpenAI-compatible API
+- `qa-relevance-offline` - answer relevance scorer running vLLM offline inference in-process
 
 `vllm` and `translator-offline` share model/cache volumes (`hf-cache`, `vllm-cache`), so model files are downloaded once and reused by both services.
 
