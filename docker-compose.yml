@@ -104,4 +104,6 @@ services:
 
 volumes:
   hf-cache:
+    name: shared-hf-cache
   vllm-cache:
+    name: shared-vllm-cache
