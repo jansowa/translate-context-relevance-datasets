@@ -116,6 +116,16 @@ This reads `out_pl/<dataset>/translated.jsonl` and writes `out_pl/<dataset>/answ
 The output row keeps the original translated record and adds an `answer_relevance` object with `explanation` and `label`.
 Completed rows are skipped on resume, so you can stop the run and continue later.
 
+Reranker scoring on the same translated Polish files:
+
+```bash
+docker compose run --rm qa-reranker-offline --datasets nq_qa hotpotqa
+```
+
+This uses `BAAI/bge-reranker-v2.5-gemma2-lightweight` and writes `out_pl/<dataset>/answer_relevance_reranker.jsonl`.
+The output row keeps the source record and adds `answer_relevance_reranker.raw_score` plus `answer_relevance_reranker.sigmoid_score`.
+Completed rows are skipped on resume here as well.
+
 Optional offline tuning flags:
 - `--offline-tensor-parallel-size`
 - `--offline-gpu-memory-utilization`
@@ -170,8 +180,10 @@ Output files are written inside the repository directory, in separate subfolders
 - `out_pl/nq/translated.jsonl`, `out_pl/nq/failed_rows.jsonl`, `out_pl/nq/checkpoints/*.json`
 - `out_pl/nq_qa/translated.jsonl`, `out_pl/nq_qa/failed_rows.jsonl`
 - `out_pl/nq_qa/answer_relevance.jsonl`, `out_pl/nq_qa/answer_relevance_failed_rows.jsonl`
+- `out_pl/nq_qa/answer_relevance_reranker.jsonl`, `out_pl/nq_qa/answer_relevance_reranker_failed_rows.jsonl`
 - `out_pl/hotpotqa/translated.jsonl`, `out_pl/hotpotqa/failed_rows.jsonl`
 - `out_pl/hotpotqa/answer_relevance.jsonl`, `out_pl/hotpotqa/answer_relevance_failed_rows.jsonl`
+- `out_pl/hotpotqa/answer_relevance_reranker.jsonl`, `out_pl/hotpotqa/answer_relevance_reranker_failed_rows.jsonl`
 - `out_pl/msmarco/translated.jsonl`, `out_pl/msmarco/failed_rows.jsonl`, `out_pl/msmarco/checkpoints/*.json`
 - `out_pl/toxic/translated.jsonl`, `out_pl/toxic/failed_rows.jsonl`, `out_pl/toxic/checkpoints/*.json`
 - `out_pl/wildguard/translated.jsonl`, `out_pl/wildguard/failed_rows.jsonl`, `out_pl/wildguard/checkpoints/*.json`
@@ -197,6 +209,8 @@ Runtime behavior:
 - use `--failed-jsonl-name <name>` to change the failed-rows file name
 - answer relevance scoring is available for `nq_qa` and `hotpotqa`; it reads translated Polish JSONL files and adds an `answer_relevance` object with structured output fields ordered as `explanation`, then `label`
 - use `qa-relevance`, `qa-relevance-external`, or `qa-relevance-offline` services for the QA scoring stage
+- reranker scoring is also available for `nq_qa` and `hotpotqa`; it uses `BAAI/bge-reranker-v2.5-gemma2-lightweight` to compute numeric pair scores and writes them to `answer_relevance_reranker.jsonl`
+- if the reranker model download is blocked on Hugging Face, provide `HF_TOKEN` in the environment before running the offline service
 
 ## Architecture
 
@@ -209,6 +223,7 @@ Runtime behavior:
 - `qa-relevance` - answer relevance scorer using the local `vllm` server
 - `qa-relevance-external` - answer relevance scorer against an external OpenAI-compatible API
 - `qa-relevance-offline` - answer relevance scorer running vLLM offline inference in-process
+- `qa-reranker-offline` - answer relevance scorer using the local Hugging Face reranker model in-process
 
 `vllm` and `translator-offline` share model/cache volumes (`hf-cache`, `vllm-cache`), so model files are downloaded once and reused by both services.
 
