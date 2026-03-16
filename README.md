@@ -1,13 +1,14 @@
 # Translate context relevance dataset (EN -> PL)
 
-This repository provides a tool for translating context-relevance HuggingFace datasets from English to Polish.
-Currently supported:
-- `zilliz/natural_questions-context-relevance-with-think` (`nq`)
-- `sentence-transformers/natural-questions` (`nq_qa`)
-- `sentence-transformers/hotpotqa` (`hotpotqa`)
-- `zilliz/msmarco-context-relevance-with-think` (`msmarco`)
-- `thesofakillers/jigsaw-toxic-comment-classification-challenge` (`toxic`, opt-in only)
-- `allenai/wildguardmix` (`wildguard`, opt-in only)
+This repository provides a tool for translating context-relevance Hugging Face datasets from English to Polish.
+
+Supported datasets:
+- [`zilliz/natural_questions-context-relevance-with-think`](https://huggingface.co/datasets/zilliz/natural_questions-context-relevance-with-think) (`nq`) - A Natural Questions-based context-relevance dataset with queries and candidate passages.
+- [`sentence-transformers/natural-questions`](https://huggingface.co/datasets/sentence-transformers/natural-questions) (`nq_qa`) - A Natural Questions QA-style dataset used here for question-answer translation and answer relevance scoring.
+- [`sentence-transformers/hotpotqa`](https://huggingface.co/datasets/sentence-transformers/hotpotqa) (`hotpotqa`) - A HotpotQA-derived triplet dataset for question-answer relevance and retrieval-style evaluation.
+- [`zilliz/msmarco-context-relevance-with-think`](https://huggingface.co/datasets/zilliz/msmarco-context-relevance-with-think) (`msmarco`) - An MS MARCO-based context-relevance dataset with queries, passages, and rationale-style annotations.
+- [`thesofakillers/jigsaw-toxic-comment-classification-challenge`](https://huggingface.co/datasets/thesofakillers/jigsaw-toxic-comment-classification-challenge) (`toxic`, opt-in only) - A toxic comment classification dataset translated with toxicity labels preserved.
+- [`allenai/wildguardmix`](https://huggingface.co/datasets/allenai/wildguardmix) (`wildguard`, opt-in only) - A safety dataset with benign and harmful prompts translated while preserving their safety intent.
 
 The pipeline can run in three modes:
 - local mode with **vLLM (OpenAI-compatible API)**
