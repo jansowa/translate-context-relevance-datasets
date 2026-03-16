@@ -157,7 +157,7 @@ services:
   qa-reranker-offline:
     build:
       context: .
-      dockerfile: Dockerfile.translator-offline
+      dockerfile: Dockerfile.reranker-offline
     env_file:
       - .env
     environment:
@@ -182,5 +182,7 @@ services:
 volumes:
   hf-cache:
     name: shared-hf-cache
+    external: true
   vllm-cache:
     name: shared-vllm-cache
+    external: true

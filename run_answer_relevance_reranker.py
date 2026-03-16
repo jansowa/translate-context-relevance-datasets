@@ -3,13 +3,14 @@
 
 import argparse
 import importlib.util
+import json
 import logging
 import math
 import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 from tqdm import tqdm
 
@@ -19,7 +20,7 @@ from run_answer_relevance_vllm import (
     resolve_row_id,
     selected_dataset_keys,
 )
-from translation_core import append_jsonl, load_done_ids_from_jsonl
+from translation_core import load_done_ids_from_jsonl
 
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-v2.5-gemma2-lightweight"
 DEFAULT_RERANKER_PROMPT = "Predict whether passage B contains an answer to query A."
@@ -27,6 +28,8 @@ DEFAULT_RERANKER_MAX_LENGTH = 1024
 DEFAULT_RERANKER_CUTOFF_LAYERS = [28]
 DEFAULT_RERANKER_COMPRESS_RATIO = 1
 DEFAULT_RERANKER_COMPRESS_LAYERS: list[int] = []
+DEFAULT_JSONL_WRITE_BUFFER = 128
+
 RERANKER_PRESETS: dict[str, dict[str, Any]] = {
     "fast": {
         "reranker_max_length": 1024,
@@ -53,6 +56,16 @@ RERANKER_PRESETS: dict[str, dict[str, Any]] = {
 class ScoredRow:
     rid: str
     out_row: dict[str, Any]
+
+
+@dataclass
+class CandidateRow:
+    row_idx: int
+    row: dict[str, Any]
+    rid: str
+    query: str
+    passage: str
+    estimated_tokens: int
 
 
 def parse_int_list(raw_values: list[str] | None, *, default: list[int]) -> list[int]:
@@ -160,42 +173,46 @@ def last_logit_pool(torch_module: Any, logits: Any, attention_mask: Any) -> Any:
     if left_padding:
         return logits[:, -1]
     sequence_lengths = attention_mask.sum(dim=1) - 1
-    batch_size = logits.shape[0]
-    return torch_module.stack([logits[i, sequence_lengths[i]] for i in range(batch_size)], dim=0)
+    batch_indices = torch_module.arange(logits.shape[0], device=logits.device)
+    return logits[batch_indices, sequence_lengths]
 
 
 def build_model_inputs(
     pairs: list[tuple[str, str]],
     tokenizer: Any,
     *,
-    prompt: str,
+    prompt_inputs: list[int],
+    sep_inputs: list[int],
     max_length: int,
 ) -> tuple[Any, list[int], list[int]]:
-    sep = "\n"
-    prompt_inputs = tokenizer(prompt, return_tensors=None, add_special_tokens=False)["input_ids"]
-    sep_inputs = tokenizer(sep, return_tensors=None, add_special_tokens=False)["input_ids"]
+    query_texts = [f"A: {query}" for query, _ in pairs]
+    passage_texts = [f"B: {passage}" for _, passage in pairs]
+
+    query_batch = tokenizer(
+        query_texts,
+        return_tensors=None,
+        add_special_tokens=False,
+        max_length=max_length * 3 // 4,
+        truncation=True,
+    )
+    passage_batch = tokenizer(
+        passage_texts,
+        return_tensors=None,
+        add_special_tokens=False,
+        max_length=max_length,
+        truncation=True,
+    )
+
     inputs: list[dict[str, Any]] = []
     query_lengths: list[int] = []
     prompt_lengths: list[int] = []
+    bos_token_id = tokenizer.bos_token_id
 
-    for query, passage in pairs:
-        query_inputs = tokenizer(
-            f"A: {query}",
-            return_tensors=None,
-            add_special_tokens=False,
-            max_length=max_length * 3 // 4,
-            truncation=True,
-        )
-        passage_inputs = tokenizer(
-            f"B: {passage}",
-            return_tensors=None,
-            add_special_tokens=False,
-            max_length=max_length,
-            truncation=True,
-        )
+    for query_ids, passage_ids in zip(query_batch["input_ids"], passage_batch["input_ids"]):
+        query_with_bos = [bos_token_id] + query_ids
         item = tokenizer.prepare_for_model(
-            [tokenizer.bos_token_id] + query_inputs["input_ids"],
-            sep_inputs + passage_inputs["input_ids"],
+            query_with_bos,
+            sep_inputs + passage_ids,
             truncation="only_second",
             max_length=max_length,
             padding=False,
@@ -206,8 +223,8 @@ def build_model_inputs(
         item["input_ids"] = item["input_ids"] + sep_inputs + prompt_inputs
         item["attention_mask"] = [1] * len(item["input_ids"])
         inputs.append(item)
-        query_lengths.append(len([tokenizer.bos_token_id] + query_inputs["input_ids"] + sep_inputs))
-        prompt_lengths.append(len(sep_inputs + prompt_inputs))
+        query_lengths.append(len(query_with_bos) + len(sep_inputs))
+        prompt_lengths.append(len(sep_inputs) + len(prompt_inputs))
 
     return (
         tokenizer.pad(
@@ -246,6 +263,110 @@ def build_output_row(
     return out_row
 
 
+def estimate_pair_tokens_heuristic(query: str, passage: str, max_length: int) -> int:
+    # Prosta heurystyka do sortowania i batchowania po podobnej długości.
+    # Nie musi być idealna — ma tylko ograniczyć padding.
+    # ~4 znaki na token to użyteczny przybliżony przelicznik.
+    estimated = (len(query) + len(passage)) // 4 + 32
+    estimated = max(32, estimated)
+    return min(max_length + 64, estimated)
+
+
+def append_jsonl_many(path: str, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def flush_jsonl_buffer(path: str, buffer_rows: list[dict[str, Any]]) -> None:
+    if not buffer_rows:
+        return
+    append_jsonl_many(path, buffer_rows)
+    buffer_rows.clear()
+
+
+def build_candidates(
+    rows: list[dict[str, Any]],
+    *,
+    dataset_key: str,
+    skip: int,
+    end_idx: int,
+    done_ids: set[str],
+    failed_ids: set[str],
+    max_length: int,
+) -> tuple[list[CandidateRow], int]:
+    candidates: list[CandidateRow] = []
+    skipped_failed = 0
+
+    for row_idx in range(skip, end_idx):
+        row = rows[row_idx]
+        rid = resolve_row_id(row, dataset_key, row_idx)
+        if rid in done_ids:
+            continue
+        if rid in failed_ids:
+            skipped_failed += 1
+            continue
+
+        query, passage = extract_question_answer(row, dataset_key)
+        estimated_tokens = estimate_pair_tokens_heuristic(query, passage, max_length)
+        candidates.append(
+            CandidateRow(
+                row_idx=row_idx,
+                row=row,
+                rid=rid,
+                query=query,
+                passage=passage,
+                estimated_tokens=estimated_tokens,
+            )
+        )
+
+    return candidates, skipped_failed
+
+
+def maybe_sort_candidates(candidates: list[CandidateRow], mode: str) -> list[CandidateRow]:
+    if mode == "off":
+        return candidates
+    if mode == "length":
+        return sorted(candidates, key=lambda item: item.estimated_tokens)
+    raise ValueError(f"Unsupported length bucketing mode: {mode}")
+
+
+def iter_candidate_batches(
+    candidates: list[CandidateRow],
+    *,
+    max_batch_size: int,
+    max_batch_tokens: int,
+) -> Iterator[list[CandidateRow]]:
+    batch: list[CandidateRow] = []
+    batch_tokens = 0
+
+    for item in candidates:
+        item_tokens = max(1, int(item.estimated_tokens))
+        would_exceed_size = len(batch) >= max_batch_size
+        would_exceed_tokens = bool(batch) and max_batch_tokens > 0 and (batch_tokens + item_tokens) > max_batch_tokens
+
+        if would_exceed_size or would_exceed_tokens:
+            yield batch
+            batch = []
+            batch_tokens = 0
+
+        batch.append(item)
+        batch_tokens += item_tokens
+
+        flush_due_to_size = len(batch) >= max_batch_size
+        flush_due_to_tokens = max_batch_tokens > 0 and batch_tokens >= max_batch_tokens
+        if flush_due_to_size or flush_due_to_tokens:
+            yield batch
+            batch = []
+            batch_tokens = 0
+
+    if batch:
+        yield batch
+
+
 class GemmaLightweightReranker:
     def __init__(self, args: argparse.Namespace) -> None:
         try:
@@ -265,6 +386,7 @@ class GemmaLightweightReranker:
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._is_quantized_8bit = False
         self._load_in_8bit = bool(args.reranker_load_in_8bit) and self._device.type == "cuda"
+
         logging.info(
             "Reranker parameters: preset=%s max_length=%d cutoff_layers=%s compress_ratio=%d compress_layers=%s",
             args.reranker_preset or "none",
@@ -280,6 +402,9 @@ class GemmaLightweightReranker:
         )
         tokenizer.padding_side = "right"
 
+        self._sep_inputs = tokenizer("\n", return_tensors=None, add_special_tokens=False)["input_ids"]
+        self._prompt_inputs = tokenizer(self._prompt, return_tensors=None, add_special_tokens=False)["input_ids"]
+
         if self._load_in_8bit:
             missing_runtime: list[str] = []
             if importlib.util.find_spec("bitsandbytes") is None:
@@ -293,17 +418,31 @@ class GemmaLightweightReranker:
                     f"{missing}. Install them before running CUDA int8 scoring."
                 )
 
+            # quantization_config = BitsAndBytesConfig(
+            #     load_in_8bit=True,
+            #     llm_int8_enable_fp32_cpu_offload=bool(args.reranker_int8_cpu_offload),
+            # )
+            # try:
+            #     model = AutoModelForCausalLM.from_pretrained(
+            #         args.reranker_model,
+            #         trust_remote_code=True,
+            #         quantization_config=quantization_config,
+            #         device_map="auto",
+            #         torch_dtype="auto",
+            #         low_cpu_mem_usage=True,
+            #     )
             quantization_config = BitsAndBytesConfig(
                 load_in_8bit=True,
-                llm_int8_enable_fp32_cpu_offload=bool(args.reranker_int8_cpu_offload),
+                llm_int8_enable_fp32_cpu_offload=False,
             )
+
             try:
                 model = AutoModelForCausalLM.from_pretrained(
                     args.reranker_model,
                     trust_remote_code=True,
                     quantization_config=quantization_config,
-                    device_map="auto",
-                    dtype="auto",
+                    device_map=0,  # cały model na GPU 0
+                    torch_dtype="auto",
                     low_cpu_mem_usage=True,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -325,6 +464,9 @@ class GemmaLightweightReranker:
         self._tokenizer = tokenizer
         self._model = model
         self._input_device = self._get_input_device(self._model)
+        if hasattr(model, "hf_device_map"):
+            logging.info("hf_device_map=%s", model.hf_device_map)
+
         logging.info(
             "Reranker model loaded: model=%s load_in_8bit=%s int8_cpu_offload=%s scoring_device=%s",
             args.reranker_model,
@@ -333,17 +475,28 @@ class GemmaLightweightReranker:
             self._input_device,
         )
 
+    # def _get_input_device(self, model: Any) -> Any:
+    #     if self._is_quantized_8bit:
+    #         try:
+    #             return next(model.parameters()).device
+    #         except StopIteration:
+    #             return self._torch.device(self._device)
+    #
+    #     if hasattr(model, "device"):
+    #         try:
+    #             return self._torch.device(model.device)
+    #         except Exception:  # noqa: BLE001
+    #             pass
+    #
+    #     try:
+    #         return next(model.parameters()).device
+    #     except StopIteration:
+    #         return self._torch.device(self._device)
     def _get_input_device(self, model: Any) -> Any:
-        if self._is_quantized_8bit:
-            try:
-                return next(model.parameters()).device
-            except StopIteration:
-                return self._torch.device(self._device)
-
         if hasattr(model, "device"):
             try:
                 return self._torch.device(model.device)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
 
         try:
@@ -352,10 +505,13 @@ class GemmaLightweightReranker:
             return self._torch.device(self._device)
 
     def _move_batch_to_device(self, batch: Any, device: Any) -> Any:
-        if hasattr(batch, "to"):
-            return batch.to(device)
         if self._torch.is_tensor(batch):
-            return batch.to(device)
+            return batch.to(device, non_blocking=True)
+        if hasattr(batch, "to"):
+            try:
+                return batch.to(device)
+            except TypeError:
+                return batch.to(device=device)
         if isinstance(batch, dict):
             return {key: self._move_batch_to_device(value, device) for key, value in batch.items()}
         if isinstance(batch, list):
@@ -368,11 +524,12 @@ class GemmaLightweightReranker:
         if not pairs:
             return []
 
-        with self._torch.no_grad():
+        with self._torch.inference_mode():
             inputs, query_lengths, prompt_lengths = build_model_inputs(
                 pairs,
                 self._tokenizer,
-                prompt=self._prompt,
+                prompt_inputs=self._prompt_inputs,
+                sep_inputs=self._sep_inputs,
                 max_length=self._max_length,
             )
             input_device = self._get_input_device(self._model)
@@ -387,8 +544,8 @@ class GemmaLightweightReranker:
                 prompt_lengths=prompt_lengths,
             )
             pooled = last_logit_pool(self._torch, outputs.logits[-1], outputs.attention_masks[-1])
-            yes_scores = pooled[:, self._tokenizer.yes_loc].detach().cpu().float().tolist()
-            return [(float(raw_score), sigmoid(float(raw_score))) for raw_score in yes_scores]
+            raw_scores = pooled.detach().cpu().float().tolist()
+            return [(float(raw_score), sigmoid(float(raw_score))) for raw_score in raw_scores]
 
 
 def parse_args() -> argparse.Namespace:
@@ -416,6 +573,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-rows", type=int, default=0, help="0 = all")
     p.add_argument("--skip-rows", type=int, default=0)
     p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument(
+        "--max-batch-tokens",
+        type=int,
+        default=0,
+        help="Optional heuristic token budget per batch. 0 disables token-budget batching.",
+    )
+    p.add_argument(
+        "--length-bucketing",
+        choices=["off", "length"],
+        default="length",
+        help="Batch samples with similar estimated length together. Default: length.",
+    )
+    p.add_argument(
+        "--jsonl-write-buffer",
+        type=int,
+        default=DEFAULT_JSONL_WRITE_BUFFER,
+        help="Number of output rows buffered before JSONL flush.",
+    )
     p.add_argument("--reranker-model", default=os.getenv("RERANKER_MODEL_NAME", DEFAULT_RERANKER_MODEL))
     p.add_argument("--reranker-prompt", default=os.getenv("RERANKER_PROMPT", DEFAULT_RERANKER_PROMPT))
     p.add_argument(
@@ -473,24 +648,21 @@ def parse_args() -> argparse.Namespace:
 
 def score_rows_or_fallback(
     reranker: GemmaLightweightReranker,
-    batch: list[tuple[int, dict[str, Any]]],
+    batch: list[CandidateRow],
     dataset_key: str,
     args: argparse.Namespace,
 ) -> tuple[list[ScoredRow], list[dict[str, Any]]]:
-    pairs: list[tuple[str, str]] = []
-    for _, row in batch:
-        pairs.append(extract_question_answer(row, dataset_key))
+    pairs = [(item.query, item.passage) for item in batch]
 
     try:
         scores = reranker.score_pairs(pairs)
-        results = []
-        for (row_idx, row), (raw_score, sigmoid_score) in zip(batch, scores):
-            rid = resolve_row_id(row, dataset_key, row_idx)
+        results: list[ScoredRow] = []
+        for item, (raw_score, sigmoid_score) in zip(batch, scores):
             results.append(
                 ScoredRow(
-                    rid=rid,
+                    rid=item.rid,
                     out_row=build_output_row(
-                        row,
+                        item.row,
                         raw_score=raw_score,
                         sigmoid_score=sigmoid_score,
                         args=args,
@@ -500,23 +672,24 @@ def score_rows_or_fallback(
         return results, []
     except Exception as exc:  # noqa: BLE001
         if len(batch) == 1:
-            row_idx, row = batch[0]
-            rid = resolve_row_id(row, dataset_key, row_idx)
+            item = batch[0]
             return [], [
                 {
-                    "id": rid,
+                    "id": item.rid,
                     "source_dataset": dataset_key,
-                    "row_idx": row_idx,
+                    "row_idx": item.row_idx,
                     "error": str(exc),
                     "error_type": type(exc).__name__,
                     "timestamp_unix": int(time.time()),
                 }
             ]
 
+        batch_estimated_tokens = sum(item.estimated_tokens for item in batch)
         logging.warning(
-            "Batch scoring failed for dataset=%s batch_size=%d. Retrying rows individually. Error: %s",
+            "Batch scoring failed for dataset=%s batch_size=%d estimated_tokens=%d. Retrying rows individually. Error: %s",
             dataset_key,
             len(batch),
+            batch_estimated_tokens,
             exc,
         )
         ok_rows: list[ScoredRow] = []
@@ -546,17 +719,16 @@ def run_single_dataset(args: argparse.Namespace, reranker: GemmaLightweightReran
     done_ids = load_done_ids_from_jsonl(out_jsonl)
     failed_ids = set() if args.retry_failed_rows else load_done_ids_from_jsonl(failed_jsonl)
 
-    candidates: list[tuple[int, dict[str, Any]]] = []
-    skipped_failed = 0
-    for row_idx in range(skip, end_idx):
-        row = rows[row_idx]
-        rid = resolve_row_id(row, args.dataset_key, row_idx)
-        if rid in done_ids:
-            continue
-        if rid in failed_ids:
-            skipped_failed += 1
-            continue
-        candidates.append((row_idx, row))
+    candidates, skipped_failed = build_candidates(
+        rows,
+        dataset_key=args.dataset_key,
+        skip=skip,
+        end_idx=end_idx,
+        done_ids=done_ids,
+        failed_ids=failed_ids,
+        max_length=int(args.reranker_max_length),
+    )
+    candidates = maybe_sort_candidates(candidates, args.length_bucketing)
 
     if not candidates:
         if skipped_failed:
@@ -569,13 +741,16 @@ def run_single_dataset(args: argparse.Namespace, reranker: GemmaLightweightReran
         return 0
 
     logging.info(
-        "Reranker run: dataset_key=%s input=%s output=%s model=%s batch_size=%d range=%d..%d total_in_range=%d pending=%d "
-        "done_before=%d skipped_failed=%d retry_failed_rows=%s",
+        "Reranker run: dataset_key=%s input=%s output=%s model=%s batch_size=%d max_batch_tokens=%d "
+        "length_bucketing=%s range=%d..%d total_in_range=%d pending=%d done_before=%d skipped_failed=%d "
+        "retry_failed_rows=%s",
         args.dataset_key,
         input_jsonl,
         out_jsonl,
         args.reranker_model,
         int(args.batch_size),
+        int(args.max_batch_tokens),
+        args.length_bucketing,
         skip,
         end_idx - 1,
         end_idx - skip,
@@ -598,23 +773,37 @@ def run_single_dataset(args: argparse.Namespace, reranker: GemmaLightweightReran
     )
 
     failed_count = 0
+    out_buffer: list[dict[str, Any]] = []
+    failed_buffer: list[dict[str, Any]] = []
+    batch_iter = iter_candidate_batches(
+        candidates,
+        max_batch_size=max(1, int(args.batch_size)),
+        max_batch_tokens=max(0, int(args.max_batch_tokens)),
+    )
+
     try:
-        for start in range(0, len(candidates), max(1, int(args.batch_size))):
-            batch = candidates[start : start + max(1, int(args.batch_size))]
+        for batch in batch_iter:
             ok_rows, failed_rows = score_rows_or_fallback(reranker, batch, args.dataset_key, args)
 
             for item in ok_rows:
                 if item.rid not in done_ids:
-                    append_jsonl(out_jsonl, item.out_row)
+                    out_buffer.append(item.out_row)
                     done_ids.add(item.rid)
 
             for failed_obj in failed_rows:
-                append_jsonl(failed_jsonl, failed_obj)
+                failed_buffer.append(failed_obj)
                 failed_count += 1
+
+            if len(out_buffer) >= int(args.jsonl_write_buffer):
+                flush_jsonl_buffer(out_jsonl, out_buffer)
+            if len(failed_buffer) >= int(args.jsonl_write_buffer):
+                flush_jsonl_buffer(failed_jsonl, failed_buffer)
 
             pbar.update(len(batch))
     finally:
         pbar.close()
+        flush_jsonl_buffer(out_jsonl, out_buffer)
+        flush_jsonl_buffer(failed_jsonl, failed_buffer)
 
     if failed_count:
         logging.warning("Done with row failures: %d failed rows. See %s", failed_count, failed_jsonl)

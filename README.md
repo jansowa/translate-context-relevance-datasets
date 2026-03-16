@@ -125,6 +125,7 @@ docker compose run --rm qa-reranker-offline --datasets nq_qa hotpotqa
 This uses `BAAI/bge-reranker-v2.5-gemma2-lightweight` and writes `out_pl/<dataset>/answer_relevance_reranker.jsonl`.
 The output row keeps the source record and adds `answer_relevance_reranker.raw_score` plus `answer_relevance_reranker.sigmoid_score`.
 Completed rows are skipped on resume here as well.
+The reranker service uses a dedicated GPU image with its own pinned Hugging Face stack, separate from the `vllm` image.
 
 Optional offline tuning flags:
 - `--offline-tensor-parallel-size`
@@ -223,7 +224,7 @@ Runtime behavior:
 - `qa-relevance` - answer relevance scorer using the local `vllm` server
 - `qa-relevance-external` - answer relevance scorer against an external OpenAI-compatible API
 - `qa-relevance-offline` - answer relevance scorer running vLLM offline inference in-process
-- `qa-reranker-offline` - answer relevance scorer using the local Hugging Face reranker model in-process
+- `qa-reranker-offline` - answer relevance scorer using a dedicated GPU Hugging Face reranker image in-process
 
 `vllm` and `translator-offline` share model/cache volumes (`hf-cache`, `vllm-cache`), so model files are downloaded once and reused by both services.
 
@@ -234,7 +235,7 @@ The translator service:
   - runs row processing concurrently via `asyncio` tasks (bounded by a semaphore),
   - serializes disk writes through a dedicated writer task (queue) to reduce worker blocking.
 
-## Dependencies (uv + requirements)
+## Dependencies (translator vs reranker)
 
 In the translator image, dependencies are installed via `uv` from `requirements.txt`.
 The source dependency file is `requirements.in`.
@@ -244,6 +245,8 @@ Update pinned dependencies:
 ```bash
 uv pip compile requirements.in -o requirements.txt
 ```
+
+The standalone reranker image uses `requirements-reranker.txt` with a separately pinned GPU/Hugging Face stack so it can track a `transformers` version compatible with `BAAI/bge-reranker-v2.5-gemma2-lightweight` without affecting the `vllm` services.
 
 ## Development
 
