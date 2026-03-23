@@ -418,19 +418,6 @@ class GemmaLightweightReranker:
                     f"{missing}. Install them before running CUDA int8 scoring."
                 )
 
-            # quantization_config = BitsAndBytesConfig(
-            #     load_in_8bit=True,
-            #     llm_int8_enable_fp32_cpu_offload=bool(args.reranker_int8_cpu_offload),
-            # )
-            # try:
-            #     model = AutoModelForCausalLM.from_pretrained(
-            #         args.reranker_model,
-            #         trust_remote_code=True,
-            #         quantization_config=quantization_config,
-            #         device_map="auto",
-            #         torch_dtype="auto",
-            #         low_cpu_mem_usage=True,
-            #     )
             quantization_config = BitsAndBytesConfig(
                 load_in_8bit=True,
                 llm_int8_enable_fp32_cpu_offload=False,
@@ -441,9 +428,12 @@ class GemmaLightweightReranker:
                     args.reranker_model,
                     trust_remote_code=True,
                     quantization_config=quantization_config,
-                    device_map=0,  # cały model na GPU 0
-                    torch_dtype="auto",
+                    device_map="auto",  # cały model na GPU 0
+                    torch_dtype=torch.float16,
                     low_cpu_mem_usage=True,
+                    offload_state_dict=True,
+                    offload_folder="/cache/huggingface/offload",
+                    use_safetensors=True,
                 )
             except Exception as exc:  # noqa: BLE001
                 raise RuntimeError(
@@ -475,23 +465,6 @@ class GemmaLightweightReranker:
             self._input_device,
         )
 
-    # def _get_input_device(self, model: Any) -> Any:
-    #     if self._is_quantized_8bit:
-    #         try:
-    #             return next(model.parameters()).device
-    #         except StopIteration:
-    #             return self._torch.device(self._device)
-    #
-    #     if hasattr(model, "device"):
-    #         try:
-    #             return self._torch.device(model.device)
-    #         except Exception:  # noqa: BLE001
-    #             pass
-    #
-    #     try:
-    #         return next(model.parameters()).device
-    #     except StopIteration:
-    #         return self._torch.device(self._device)
     def _get_input_device(self, model: Any) -> Any:
         if hasattr(model, "device"):
             try:

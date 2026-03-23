@@ -49,6 +49,7 @@ Key variables in `.env`:
 - `FEW_SHOT_EXAMPLES_PATH` (optional) - path to CSV with EN->PL few-shot examples for pair-style datasets (`nq_qa`, `hotpotqa`)
 - `FEW_SHOT_EXAMPLE_COUNT` (optional) - number of random few-shot examples prepended for each pair-style prompt (default: `3`)
 - `FEW_SHOT_SHARED_REQUESTS` (optional) - how many consecutive pair-style requests reuse the same sampled few-shot examples (default: `10`)
+- `PAIR_PROMPT_MODE` (optional) - prompt mode for pair-style datasets (`few-shot` by default, or `no-few-shot` to use the new zero-shot path for `nq_qa` and `hotpotqa`)
 
 Available profiles:
 
@@ -117,6 +118,16 @@ This reads `out_pl/<dataset>/translated.jsonl` and writes `out_pl/<dataset>/answ
 The output row keeps the original translated record and adds an `answer_relevance` object with `explanation` and `label`.
 Completed rows are skipped on resume, so you can stop the run and continue later.
 
+High-precision bad-answer filtering on the same translated Polish files:
+
+```bash
+docker compose run --rm qa-bad-answer-filter-offline --datasets nq_qa hotpotqa
+```
+
+This reads `out_pl/<dataset>/translated.jsonl` and writes `out_pl/<dataset>/bad_answer_filter.jsonl`.
+The output row keeps the original translated record and adds a `bad_answer_filter` object with `label` and `reason`.
+Completed rows are skipped on resume here as well.
+
 Reranker scoring on the same translated Polish files:
 
 ```bash
@@ -148,6 +159,8 @@ Use `--datasets` to limit the run:
 docker compose run --rm translator --datasets nq
 docker compose run --rm translator --datasets nq_qa
 docker compose run --rm translator --datasets hotpotqa
+docker compose run --rm translator --datasets nq_qa --pair-prompt-mode no-few-shot
+docker compose run --rm translator --datasets hotpotqa --pair-prompt-mode no-few-shot
 docker compose run --rm translator --datasets msmarco
 docker compose run --rm translator --datasets toxic --split train
 docker compose run --rm translator --datasets wildguard --split train
@@ -182,9 +195,11 @@ Output files are written inside the repository directory, in separate subfolders
 - `out_pl/nq/translated.jsonl`, `out_pl/nq/failed_rows.jsonl`, `out_pl/nq/checkpoints/*.json`
 - `out_pl/nq_qa/translated.jsonl`, `out_pl/nq_qa/failed_rows.jsonl`
 - `out_pl/nq_qa/answer_relevance.jsonl`, `out_pl/nq_qa/answer_relevance_failed_rows.jsonl`
+- `out_pl/nq_qa/bad_answer_filter.jsonl`, `out_pl/nq_qa/bad_answer_filter_failed_rows.jsonl`
 - `out_pl/nq_qa/answer_relevance_reranker.jsonl`, `out_pl/nq_qa/answer_relevance_reranker_failed_rows.jsonl`
 - `out_pl/hotpotqa/translated.jsonl`, `out_pl/hotpotqa/failed_rows.jsonl`
 - `out_pl/hotpotqa/answer_relevance.jsonl`, `out_pl/hotpotqa/answer_relevance_failed_rows.jsonl`
+- `out_pl/hotpotqa/bad_answer_filter.jsonl`, `out_pl/hotpotqa/bad_answer_filter_failed_rows.jsonl`
 - `out_pl/hotpotqa/answer_relevance_reranker.jsonl`, `out_pl/hotpotqa/answer_relevance_reranker_failed_rows.jsonl`
 - `out_pl/msmarco/translated.jsonl`, `out_pl/msmarco/failed_rows.jsonl`, `out_pl/msmarco/checkpoints/*.json`
 - `out_pl/toxic/translated.jsonl`, `out_pl/toxic/failed_rows.jsonl`, `out_pl/toxic/checkpoints/*.json`
@@ -210,7 +225,9 @@ Runtime behavior:
 - use `--fail-fast` to stop the entire run on the first failed row
 - use `--failed-jsonl-name <name>` to change the failed-rows file name
 - answer relevance scoring is available for `nq_qa` and `hotpotqa`; it reads translated Polish JSONL files and adds an `answer_relevance` object with structured output fields ordered as `explanation`, then `label`
+- high-precision bad-answer filtering is available for `nq_qa` and `hotpotqa`; run it with `--task bad_answer_filter` or the dedicated `qa-bad-answer-filter*` services, and it writes `bad_answer_filter.jsonl`
 - use `qa-relevance`, `qa-relevance-external`, or `qa-relevance-offline` services for the QA scoring stage
+- use `qa-bad-answer-filter`, `qa-bad-answer-filter-external`, or `qa-bad-answer-filter-offline` services for the high-precision bad-answer filtering stage
 - reranker scoring is also available for `nq_qa` and `hotpotqa`; it uses `BAAI/bge-reranker-v2.5-gemma2-lightweight` to compute numeric pair scores and writes them to `answer_relevance_reranker.jsonl`
 - if the reranker model download is blocked on Hugging Face, provide `HF_TOKEN` in the environment before running the offline service
 
@@ -225,6 +242,9 @@ Runtime behavior:
 - `qa-relevance` - answer relevance scorer using the local `vllm` server
 - `qa-relevance-external` - answer relevance scorer against an external OpenAI-compatible API
 - `qa-relevance-offline` - answer relevance scorer running vLLM offline inference in-process
+- `qa-bad-answer-filter` - high-precision bad-answer filter using the local `vllm` server
+- `qa-bad-answer-filter-external` - high-precision bad-answer filter against an external OpenAI-compatible API
+- `qa-bad-answer-filter-offline` - high-precision bad-answer filter running vLLM offline inference in-process
 - `qa-reranker-offline` - answer relevance scorer using a dedicated GPU Hugging Face reranker image in-process
 
 `vllm` and `translator-offline` share model/cache volumes (`hf-cache`, `vllm-cache`), so model files are downloaded once and reused by both services.

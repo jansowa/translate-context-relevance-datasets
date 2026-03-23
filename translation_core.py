@@ -208,6 +208,31 @@ SYSTEM_NQ_QA = (
     "Keep keyword-style questions as keywords and natural questions as natural questions."
 )
 
+SYSTEM_NQ_QA_NO_FEW_SHOT = (
+    "You are an EN->PL translator for question-answer NLP data. "
+    "Return ONLY valid JSON in exactly this format: "
+    '{"question_pl": "...", "answer_pl": "..."} '
+    "Translate both fields fully into Polish. "
+    "Do not answer the question. Do not summarize, shorten, paraphrase, explain, or add information. "
+    "Preserve meaning, ambiguity, punctuation, numbers, quotations, symbols, casing, and formatting. "
+    "Preserve proper names unless a standard Polish form is clearly established. "
+    "Do not correct factual errors or normalize the text. "
+    "Keep natural questions as natural questions and keyword-style queries as keyword-style queries. "
+    "Keep short answers short if the source answer is short."
+)
+
+SYSTEM_PAIR_TRANSLATION_NO_FEW_SHOT = (
+    "You are an EN->PL translator for paired NLP data. "
+    "Return ONLY valid JSON in exactly this format: "
+    '{"anchor_pl": "...", "positive_pl": "..."} '
+    "Translate both texts fully into Polish. "
+    "Do not summarize, shorten, paraphrase, explain, or add information. "
+    "Preserve meaning, ambiguity, punctuation, numbers, quotations, symbols, casing, and formatting. "
+    "Preserve proper names unless a standard Polish form is clearly established. "
+    "Do not correct factual errors or normalize the text. "
+    "Keep the two texts semantically aligned."
+)
+
 SYSTEM_PAIR_TRANSLATION = (
     "You are an EN->PL translator for paired NLP data. Return ONLY valid JSON. "
     "Do not add any comments or markdown. "
@@ -536,6 +561,22 @@ def _build_pair_user_turn(
     )
 
 
+def _build_pair_user_turn_no_few_shot(
+    left_label: str,
+    left_en: str,
+    right_label: str,
+    right_en: str,
+) -> str:
+    return (
+        "Translate both input texts from English to Polish.\n"
+        "Return ONLY valid JSON.\n"
+        "Do not answer, summarize, shorten, paraphrase, or explain.\n"
+        "Preserve full content, ambiguity, punctuation, numbers, and formatting.\n\n"
+        f"{left_label}_EN: {left_en}\n"
+        f"{right_label}_EN: {right_en}\n"
+    )
+
+
 def _build_pair_assistant_turn(
     left_pl_key: str,
     left_pl: str,
@@ -609,6 +650,26 @@ def build_pair_few_shot_messages(
     return messages
 
 
+def build_pair_zero_shot_messages(
+    left_en: str,
+    right_en: str,
+    *,
+    left_label: str,
+    right_label: str,
+) -> List[Dict[str, str]]:
+    return [
+        {
+            "role": "user",
+            "content": _build_pair_user_turn_no_few_shot(
+                left_label,
+                left_en,
+                right_label,
+                right_en,
+            ),
+        }
+    ]
+
+
 def build_nq_qa_few_shot_messages(
     question_en: str,
     answer_en: str,
@@ -630,6 +691,18 @@ def build_nq_qa_few_shot_messages(
     )
 
 
+def build_nq_qa_zero_shot_messages(
+    question_en: str,
+    answer_en: str,
+) -> List[Dict[str, str]]:
+    return build_pair_zero_shot_messages(
+        left_en=question_en,
+        right_en=answer_en,
+        left_label="QUESTION",
+        right_label="ANSWER",
+    )
+
+
 def build_hotpotqa_few_shot_messages(
     anchor_en: str,
     positive_en: str,
@@ -648,4 +721,16 @@ def build_hotpotqa_few_shot_messages(
         examples_path=examples_path,
         example_count=example_count,
         sampled_examples=sampled_examples,
+    )
+
+
+def build_hotpotqa_zero_shot_messages(
+    anchor_en: str,
+    positive_en: str,
+) -> List[Dict[str, str]]:
+    return build_pair_zero_shot_messages(
+        left_en=anchor_en,
+        right_en=positive_en,
+        left_label="ANCHOR",
+        right_label="POSITIVE",
     )

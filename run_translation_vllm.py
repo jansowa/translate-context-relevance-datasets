@@ -23,8 +23,10 @@ from tqdm import tqdm
 from translation_core import (
     DEFAULT_FEW_SHOT_EXAMPLES_PATH,
     SYSTEM_PAIR_TRANSLATION,
+    SYSTEM_PAIR_TRANSLATION_NO_FEW_SHOT,
     SYSTEM_QUERY,
     SYSTEM_NQ_QA,
+    SYSTEM_NQ_QA_NO_FEW_SHOT,
     SYSTEM_TEXT_SIMPLE,
     SYSTEM_TEXT,
     TOXIC_LABEL_DESCRIPTIONS,
@@ -32,7 +34,9 @@ from translation_core import (
     RateLimitReached,
     append_jsonl,
     build_hotpotqa_few_shot_messages,
+    build_hotpotqa_zero_shot_messages,
     build_nq_qa_few_shot_messages,
+    build_nq_qa_zero_shot_messages,
     build_toxic_comment_prompt,
     build_wildguard_prompt,
     build_text_prompt,
@@ -622,18 +626,19 @@ def get_nq_qa_question_en(row: dict[str, Any]) -> str:
     return question_en
 
 
-def uses_grouped_few_shot_examples(dataset_key: str) -> bool:
-    return dataset_key in ("nq_qa", "hotpotqa")
+def pair_prompt_uses_few_shot(dataset_key: str, prompt_mode: str) -> bool:
+    return dataset_key in ("nq_qa", "hotpotqa") and prompt_mode == "few-shot"
 
 
 def build_shared_few_shot_examples_by_rid(
     candidates: list[tuple[int, dict[str, Any]]],
     dataset_key: str,
+    prompt_mode: str,
     examples_path: str,
     example_count: int,
     shared_requests: int,
 ) -> dict[str, list[dict[str, str]]]:
-    if not uses_grouped_few_shot_examples(dataset_key):
+    if not pair_prompt_uses_few_shot(dataset_key, prompt_mode):
         return {}
 
     group_size = max(1, int(shared_requests))
@@ -1119,13 +1124,21 @@ async def process_row_nq_qa(
         "active_model": None,
         "active_key_last6": None,
     }
-    messages = build_nq_qa_few_shot_messages(
-        question_en=question_en,
-        answer_en=row["answer"],
-        examples_path=args.few_shot_examples_path,
-        example_count=args.few_shot_example_count,
-        sampled_examples=sampled_examples,
-    )
+    if args.pair_prompt_mode == "no-few-shot":
+        messages = build_nq_qa_zero_shot_messages(
+            question_en=question_en,
+            answer_en=row["answer"],
+        )
+        system_prompt = SYSTEM_NQ_QA_NO_FEW_SHOT
+    else:
+        messages = build_nq_qa_few_shot_messages(
+            question_en=question_en,
+            answer_en=row["answer"],
+            examples_path=args.few_shot_examples_path,
+            example_count=args.few_shot_example_count,
+            sampled_examples=sampled_examples,
+        )
+        system_prompt = SYSTEM_NQ_QA
     schema = {
         "type": "object",
         "properties": {
@@ -1138,7 +1151,7 @@ async def process_row_nq_qa(
     translated_obj = await llm_call_json_async(
         client=client,
         model=args.model,
-        system_prompt=SYSTEM_NQ_QA,
+        system_prompt=system_prompt,
         user_prompt=None,
         temperature=args.temperature,
         max_retries=args.max_retries,
@@ -1178,13 +1191,21 @@ async def process_row_hotpotqa(
         "active_model": None,
         "active_key_last6": None,
     }
-    messages = build_hotpotqa_few_shot_messages(
-        anchor_en=row["anchor"],
-        positive_en=row["positive"],
-        examples_path=args.few_shot_examples_path,
-        example_count=args.few_shot_example_count,
-        sampled_examples=sampled_examples,
-    )
+    if args.pair_prompt_mode == "no-few-shot":
+        messages = build_hotpotqa_zero_shot_messages(
+            anchor_en=row["anchor"],
+            positive_en=row["positive"],
+        )
+        system_prompt = SYSTEM_PAIR_TRANSLATION_NO_FEW_SHOT
+    else:
+        messages = build_hotpotqa_few_shot_messages(
+            anchor_en=row["anchor"],
+            positive_en=row["positive"],
+            examples_path=args.few_shot_examples_path,
+            example_count=args.few_shot_example_count,
+            sampled_examples=sampled_examples,
+        )
+        system_prompt = SYSTEM_PAIR_TRANSLATION
     schema = {
         "type": "object",
         "properties": {
@@ -1197,7 +1218,7 @@ async def process_row_hotpotqa(
     translated_obj = await llm_call_json_async(
         client=client,
         model=args.model,
-        system_prompt=SYSTEM_PAIR_TRANSLATION,
+        system_prompt=system_prompt,
         user_prompt=None,
         temperature=args.temperature,
         max_retries=args.max_retries,
@@ -1347,6 +1368,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.getenv("FEW_SHOT_SHARED_REQUESTS", "10")),
         help="How many consecutive pair-style requests should reuse the same sampled few-shot examples.",
+    )
+    p.add_argument(
+        "--pair-prompt-mode",
+        default=os.getenv("PAIR_PROMPT_MODE", "few-shot"),
+        choices=["few-shot", "no-few-shot"],
+        help="Prompt mode for pair-style datasets (`nq_qa`, `hotpotqa`). Default preserves the existing few-shot path.",
     )
     p.add_argument(
         "--fail-fast",
@@ -1547,6 +1574,7 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
     args._few_shot_examples_by_rid = build_shared_few_shot_examples_by_rid(
         candidates=candidates,
         dataset_key=args.dataset_key,
+        prompt_mode=args.pair_prompt_mode,
         examples_path=args.few_shot_examples_path,
         example_count=args.few_shot_example_count,
         shared_requests=args.few_shot_shared_requests,
@@ -1587,7 +1615,7 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
         len(candidates_with_ckpt),
         len(candidates_fresh),
     )
-    if uses_grouped_few_shot_examples(args.dataset_key):
+    if pair_prompt_uses_few_shot(args.dataset_key, args.pair_prompt_mode):
         logging.info(
             "Few-shot grouping: shared_requests=%d example_count=%d groups=%d",
             int(args.few_shot_shared_requests),

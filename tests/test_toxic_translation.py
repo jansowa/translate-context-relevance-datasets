@@ -10,7 +10,9 @@ import pytest
 from translation_core import (
     append_jsonl,
     build_hotpotqa_few_shot_messages,
+    build_hotpotqa_zero_shot_messages,
     build_nq_qa_few_shot_messages,
+    build_nq_qa_zero_shot_messages,
     build_toxic_comment_prompt,
     build_wildguard_prompt,
     load_done_ids_from_jsonl,
@@ -49,6 +51,7 @@ from run_translation_vllm import (  # noqa: E402
     build_out_row_from_state_toxic,
     build_out_row_from_state_wildguard,
     load_dataset_for_run,
+    pair_prompt_uses_few_shot,
     parse_args,
     reorder_candidates_for_prompt_cache,
     resolve_api_connection,
@@ -97,6 +100,13 @@ def test_parse_args_accepts_few_shot_shared_requests(monkeypatch) -> None:
     monkeypatch.setattr(sys, "argv", ["prog", "--datasets", "nq_qa", "--few-shot-shared-requests", "10"])
     args = parse_args()
     assert args.few_shot_shared_requests == 10
+
+
+def test_parse_args_accepts_pair_prompt_mode(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_NAME", "test-model")
+    monkeypatch.setattr(sys, "argv", ["prog", "--datasets", "hotpotqa", "--pair-prompt-mode", "no-few-shot"])
+    args = parse_args()
+    assert args.pair_prompt_mode == "no-few-shot"
 
 
 def test_selected_dataset_keys_all_excludes_toxic() -> None:
@@ -449,6 +459,43 @@ def test_build_hotpotqa_few_shot_messages_uses_anchor_and_positive_labels(monkey
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def test_build_nq_qa_zero_shot_messages_uses_single_user_turn() -> None:
+    messages = build_nq_qa_zero_shot_messages(
+        question_en="target question",
+        answer_en="target answer",
+    )
+
+    assert len(messages) == 1
+    assert messages[0]["role"] == "user"
+    assert "Do not summarize, shorten, or answer the question." in messages[0]["content"]
+    assert "QUESTION (EN)" in messages[0]["content"]
+    assert "ANSWER (EN)" in messages[0]["content"]
+    assert "target question" in messages[0]["content"]
+    assert "target answer" in messages[0]["content"]
+
+
+def test_build_hotpotqa_zero_shot_messages_uses_single_user_turn() -> None:
+    messages = build_hotpotqa_zero_shot_messages(
+        anchor_en="target anchor",
+        positive_en="target positive",
+    )
+
+    assert len(messages) == 1
+    assert messages[0]["role"] == "user"
+    assert "Preserve the full content of the second text even when it is long." in messages[0]["content"]
+    assert "ANCHOR (EN)" in messages[0]["content"]
+    assert "POSITIVE (EN)" in messages[0]["content"]
+    assert "target anchor" in messages[0]["content"]
+    assert "target positive" in messages[0]["content"]
+
+
+def test_pair_prompt_uses_few_shot_only_for_pair_datasets_in_few_shot_mode() -> None:
+    assert pair_prompt_uses_few_shot("nq_qa", "few-shot") is True
+    assert pair_prompt_uses_few_shot("hotpotqa", "few-shot") is True
+    assert pair_prompt_uses_few_shot("nq_qa", "no-few-shot") is False
+    assert pair_prompt_uses_few_shot("nq", "few-shot") is False
+
+
 def test_build_shared_few_shot_examples_by_rid_reuses_examples_for_blocks_of_ten(monkeypatch) -> None:
     calls = []
 
@@ -463,6 +510,7 @@ def test_build_shared_few_shot_examples_by_rid_reuses_examples_for_blocks_of_ten
     out = build_shared_few_shot_examples_by_rid(
         candidates=candidates,
         dataset_key="nq_qa",
+        prompt_mode="few-shot",
         examples_path="examples.csv",
         example_count=3,
         shared_requests=10,
@@ -473,6 +521,28 @@ def test_build_shared_few_shot_examples_by_rid_reuses_examples_for_blocks_of_ten
     assert out["row-10"] == out["row-19"]
     assert out["row-0"] != out["row-10"]
     assert out["row-20"] == out["row-22"]
+
+
+def test_build_shared_few_shot_examples_by_rid_returns_empty_for_no_few_shot(monkeypatch) -> None:
+    called = {"count": 0}
+
+    def fake_sample_few_shot_translation_examples(*, examples_path, example_count):
+        called["count"] += 1
+        return [{"query_text": "q", "phrase_pl": "p", "doc_text": "d", "document_pl": "a"}]
+
+    monkeypatch.setattr("run_translation_vllm.sample_few_shot_translation_examples", fake_sample_few_shot_translation_examples)
+
+    out = build_shared_few_shot_examples_by_rid(
+        candidates=[(0, {"id": "row-0"})],
+        dataset_key="nq_qa",
+        prompt_mode="no-few-shot",
+        examples_path="examples.csv",
+        example_count=1,
+        shared_requests=10,
+    )
+
+    assert out == {}
+    assert called["count"] == 0
 
 
 def test_resume_ids_loaded_from_toxic_jsonl() -> None:

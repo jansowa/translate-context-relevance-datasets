@@ -22,6 +22,11 @@ ANSWER_RELEVANCE_LABELS = (
     "unclear",
 )
 
+BAD_ANSWER_FILTER_LABELS = (
+    "keep",
+    "reject",
+)
+
 ANSWER_RELEVANCE_SYSTEM_PROMPT = """Jesteś klasyfikatorem dopasowania pytanie–odpowiedź dla danych QA.
 
 Masz ocenić, czy tekst z pola answer jest sensownym kandydatem odpowiedzi lub poprawnym kontekstem dla tekstu z pola question.
@@ -108,6 +113,37 @@ def build_answer_relevance_schema() -> dict[str, Any]:
     }
 
 
+from typing import Any
+
+def build_bad_answer_filter_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "shared_topics": {
+                "type": "array",
+                "description": "Lista wspólnych słów kluczowych, miejsc, osób lub tematów łączących DOKUMENT_A i DOKUMENT_B. Jeśli brak, pusta lista.",
+                "items": {
+                    "type": "string",
+                    "maxLength": 50
+                },
+                "maxItems": 10,
+            },
+            "technical_errors": {
+                "type": "string",
+                "description": "Opis błędów technicznych, echa (powtórzenia 1:1) lub słowo 'brak', jeśli tekst jest poprawny technicznie.",
+                "minLength": 1,
+                "maxLength": 240,
+            },
+            "label": {
+                "type": "string",
+                "enum": list(BAD_ANSWER_FILTER_LABELS),
+            },
+        },
+        "required": ["shared_topics", "technical_errors", "label"],
+        "additionalProperties": False,
+    }
+
+
 def build_answer_relevance_prompt(question: str, answer: str) -> str:
     return (
         "Oceń, czy `answer` jest sensownym kandydatem odpowiedzi lub poprawnym kontekstem dla `question`.\n"
@@ -120,6 +156,61 @@ def build_answer_relevance_prompt(question: str, answer: str) -> str:
         f"question: {json.dumps(question, ensure_ascii=False)}\n"
         f"answer: {json.dumps(answer, ensure_ascii=False)}"
     )
+
+
+import json
+
+def build_high_precision_bad_answer_prompt(anchor: str, answer: str) -> str:
+    return (
+        f"""Jesteś mechanicznym modułem analizy leksykalnej. Nie jesteś asystentem AI ani weryfikatorem faktów. Ignoruj to, czy DOKUMENT_A jest pytaniem, a DOKUMENT_B odpowiedzią. Twoim jedynym zadaniem jest ocena integralności tekstu oraz nakładania się słownictwa (słów kluczowych, nazw własnych, tematyki).
+
+Odrzuć dane (label: "reject") TYLKO w trzech przypadkach:
+1. BŁĄD TECHNICZNY: DOKUMENT_B ma urwane zdania, niezamknięte nawiasy, nielogiczne ciągi znaków (krzaki).
+2. ECHO: DOKUMENT_B jest w 100% identyczny z DOKUMENT_A (powtórzenie bez nowej treści).
+3. ZEROWY ZWIĄZEK: DOKUMENT_A i DOKUMENT_B nie mają absolutnie żadnych wspólnych słów kluczowych, miejsc, osób ani powiązania tematycznego.
+
+We wszystkich innych przypadkach, gdy występuje choćby luźne powiązanie tematyczne (te same drużyny, osoby, pojęcia), DOKUMENT_B MUSI otrzymać label "keep".
+
+Przykłady:
+
+DOKUMENT_A: "Kto był trenerem Chicago Bear, który był również głównym trenerem drużyny futbolowej University of Pittsburgh w latach 2005-2010?"
+DOKUMENT_B: "Sezon Chicago Bears w 1995 roku był ich 76. regularnym sezonem. Klub zakończył sezon pod kierownictwem Dave’a Wannstedta."
+Wynik: {{"shared_topics":["Chicago Bear", "trener"], "technical_errors": "brak", "label": "keep"}}
+
+DOKUMENT_A: "Który zawodnik, znany jako Sikkimese Sniper, grał dla East Bengal?"
+DOKUMENT_B: "Drugi półfinał Pucharu w 1997 roku odbył się pomiędzy rywalami East Bengal i Mohun Bagan. Mecz wygrał East Bengal 4-1."
+Wynik: {{"shared_topics": ["East Bengal", "mecz", "zawodnik"], "technical_errors": "brak", "label": "keep"}}
+
+DOKUMENT_A: "Walking Down Your Street"
+DOKUMENT_B: "Walking Down Your Street"
+Wynik: {{"shared_topics":[], "technical_errors": "echo - bezsensowne sklonowanie DOKUMENT_A", "label": "reject"}}
+
+DOKUMENT_A: "Chiński film 20 Once Again jest remakiem której południowokoreańskiej komedii?"
+DOKUMENT_B: "20 Once Again (chiń. 重返20岁"
+Wynik: {{"shared_topics":["20 Once Again"], "technical_errors": "ucięty tekst na końcu i niezamknięty nawias", "label": "reject"}}
+
+DOKUMENT_A: "(You Drive Me) Crazy"
+DOKUMENT_B: \"\"\"\"Puss\"/\",\"Puss/Oh, the Guilt \"Puss\"/\"\"\"\"
+Wynik: {{"shared_topics":[], "technical_errors": "krzaki, nadmiar cudzysłowów, szum", "label": "reject"}}
+
+Przeanalizuj poniższą parę w dokładnie taki sam sposób. Najpierw określ błędy techniczne, wypisz wspólne tematy/słowa, a na końcu podejmij decyzję.
+
+DOKUMENT_A:
+{json.dumps(anchor, ensure_ascii=False)}
+
+DOKUMENT_B:
+{json.dumps(answer, ensure_ascii=False)}
+
+Zwróć WYŁĄCZNIE obiekt JSON: {{"shared_topics": [lista_wspolnych_tematow], "technical_errors": "ewentualne_błędy_techniczne", "label": "keep|rejected"}}"""
+    )
+
+
+def task_output_jsonl_name(task: str) -> str:
+    return "bad_answer_filter.jsonl" if task == "bad_answer_filter" else "answer_relevance.jsonl"
+
+
+def task_failed_jsonl_name(task: str) -> str:
+    return "bad_answer_filter_failed_rows.jsonl" if task == "bad_answer_filter" else "answer_relevance_failed_rows.jsonl"
 
 
 def selected_dataset_keys(datasets_arg: list[str]) -> list[str]:
@@ -167,22 +258,64 @@ def extract_question_answer(row: dict[str, Any], dataset_key: str) -> tuple[str,
     return question, answer
 
 
+# def build_output_row(
+#     row: dict[str, Any],
+#     label: str,
+#     reason_text: str,
+#     args: argparse.Namespace,
+# ) -> dict[str, Any]:
+#     out_row = dict(row)
+#     if args.task == "bad_answer_filter":
+#         prefix = "bad_answer_filter"
+#         out_row[prefix] = {
+#             "label": label,
+#             "reason": reason_text,
+#         }
+#     else:
+#         prefix = "answer_relevance"
+#         out_row[prefix] = {
+#             "explanation": reason_text,
+#             "label": label,
+#         }
+#     out_row[f"{prefix}_model"] = args.model
+#     out_row[f"{prefix}_source"] = args.inference_source
+#     out_row[f"{prefix}_key_last6"] = args._api_key_last6
+#     out_row[f"{prefix}_base_url"] = args.base_url or None
+#     out_row[f"{prefix}_timestamp_unix"] = int(time.time())
+#     return out_row
+
+
 def build_output_row(
-    row: dict[str, Any],
-    explanation: str,
-    label: str,
-    args: argparse.Namespace,
+        row: dict[str, Any],
+        label: str,
+        result_obj: dict[str, Any],  # Zmieniamy reason_text na cały obiekt wynikowy
+        args: argparse.Namespace,
 ) -> dict[str, Any]:
     out_row = dict(row)
-    out_row["answer_relevance"] = {
-        "explanation": explanation,
-        "label": label,
-    }
-    out_row["answer_relevance_model"] = args.model
-    out_row["answer_relevance_source"] = args.inference_source
-    out_row["answer_relevance_key_last6"] = args._api_key_last6
-    out_row["answer_relevance_base_url"] = args.base_url or None
-    out_row["answer_relevance_timestamp_unix"] = int(time.time())
+
+    if args.task == "bad_answer_filter":
+        prefix = "bad_answer_filter"
+        out_row[prefix] = {
+            "label": label,
+            # Zapisujemy nowe, szczegółowe pola zamiast ogólnego 'reason'
+            "technical_errors": result_obj.get("technical_errors"),
+            "shared_topics": result_obj.get("shared_topics"),
+        }
+    else:
+        # Obsługa innych zadań (np. relevance), które mogą używać 'explanation' lub 'reason'
+        prefix = "answer_relevance"
+        out_row[prefix] = {
+            "explanation": result_obj.get("explanation") or result_obj.get("reason"),
+            "label": label,
+        }
+
+    # Metadane (bez zmian)
+    out_row[f"{prefix}_model"] = args.model
+    out_row[f"{prefix}_source"] = args.inference_source
+    out_row[f"{prefix}_key_last6"] = args._api_key_last6
+    out_row[f"{prefix}_base_url"] = args.base_url or None
+    out_row[f"{prefix}_timestamp_unix"] = int(time.time())
+
     return out_row
 
 
@@ -196,23 +329,55 @@ async def process_row(
     deps = runtime_dependencies()
     rid = resolve_row_id(row, dataset_key, row_idx)
     question, answer = extract_question_answer(row, dataset_key)
+    if args.task == "bad_answer_filter":
+        system_prompt = (
+""""""
+        )
+        user_prompt = build_high_precision_bad_answer_prompt(anchor=question, answer=answer)
+        print(f"{user_prompt=}")
+        response_schema = build_bad_answer_filter_schema()
+    else:
+        system_prompt = ANSWER_RELEVANCE_SYSTEM_PROMPT
+        user_prompt = build_answer_relevance_prompt(question=question, answer=answer)
+        response_schema = build_answer_relevance_schema()
     result_obj = await deps["llm_call_json_async"](
         client=client,
         model=args.model,
-        system_prompt=ANSWER_RELEVANCE_SYSTEM_PROMPT,
-        user_prompt=build_answer_relevance_prompt(question=question, answer=answer),
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
         temperature=args.temperature,
         max_retries=args.max_retries,
         delay_seconds=args.delay_seconds,
-        response_schema=build_answer_relevance_schema(),
+        response_schema=response_schema,
     )
-    explanation = str(result_obj.get("explanation") or "").strip()
     label = str(result_obj.get("label") or "").strip()
-    if not explanation:
-        raise RuntimeError("Empty explanation from model")
-    if label not in ANSWER_RELEVANCE_LABELS:
-        raise RuntimeError(f"Unsupported label from model: {label!r}")
-    return RowResult(rid=rid, out_row=build_output_row(row, explanation, label, args))
+    if args.task == "bad_answer_filter":
+        # Pobieramy nowe pola z obiektu wynikowego
+        tech_errors = str(result_obj.get("technical_errors") or "").strip()
+        shared_topics = result_obj.get("shared_topics")
+        label = result_obj.get("label")
+
+        # 1. Walidacja pola z błędami technicznymi
+        if not tech_errors:
+            raise RuntimeError("Model zwrócił pusty opis 'technical_errors'")
+
+        # 2. Walidacja listy tematów wspólnych (Shared Topics)
+        if not isinstance(shared_topics, list):
+            raise RuntimeError(f"Pole 'shared_topics' nie jest listą: {type(shared_topics)}")
+
+        # 3. Walidacja etykiety (label)
+        if label not in BAD_ANSWER_FILTER_LABELS:
+            raise RuntimeError(f"Nieobsługiwana etykieta od modelu: {label!r}")
+    else:
+        reason_text = str(result_obj.get("explanation") or "").strip()
+        if not reason_text:
+            raise RuntimeError("Empty explanation from model")
+        if label not in ANSWER_RELEVANCE_LABELS:
+            raise RuntimeError(f"Unsupported label from model: {label!r}")
+    return RowResult(
+        rid=rid,
+        out_row=build_output_row(row, label, result_obj, args)
+    )
 
 
 async def writer_loop(
@@ -330,10 +495,16 @@ def parse_args() -> argparse.Namespace:
         choices=["all", *DATASET_SPECS.keys()],
         help="Dataset selection. 'all' expands to nq_qa and hotpotqa.",
     )
+    p.add_argument(
+        "--task",
+        default="answer_relevance",
+        choices=["answer_relevance", "bad_answer_filter"],
+        help="Scoring task: answer relevance classifier or high-precision bad-answer filter.",
+    )
     p.add_argument("--out-dir", default="out_pl")
     p.add_argument("--input-jsonl-name", default="translated.jsonl")
-    p.add_argument("--out-jsonl-name", default="answer_relevance.jsonl")
-    p.add_argument("--failed-jsonl-name", default="answer_relevance_failed_rows.jsonl")
+    p.add_argument("--out-jsonl-name", default=None)
+    p.add_argument("--failed-jsonl-name", default=None)
     p.add_argument(
         "--retry-failed-rows",
         action="store_true",
@@ -554,6 +725,10 @@ async def run_async(args: argparse.Namespace) -> int:
     deps = runtime_dependencies()
     args.base_url, args.api_key = deps["resolve_api_connection"](args)
     args._api_key_last6 = "OFFLINE" if args.inference_source == "offline" else (args.api_key[-6:] if args.api_key else "EMPTY")
+    if args.out_jsonl_name is None:
+        args.out_jsonl_name = task_output_jsonl_name(args.task)
+    if args.failed_jsonl_name is None:
+        args.failed_jsonl_name = task_failed_jsonl_name(args.task)
 
     selected_keys = selected_dataset_keys(args.datasets)
     logging.info("Selected dataset runs: %s", ", ".join(selected_keys))
