@@ -231,6 +231,42 @@ services:
     working_dir: /app
     entrypoint: ["python3", "run_answer_relevance_reranker.py"]
 
+  qa-rule-based-filter:
+    build:
+      context: .
+      dockerfile: Dockerfile.translator
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+    working_dir: /app
+    entrypoint: ["python", "run_qa_rule_based_filter.py"]
+
+  qa-rule-based-filter-offline:
+    build:
+      context: .
+      dockerfile: Dockerfile.translator-offline
+    env_file:
+      - .env
+    environment:
+      HF_HOME: /cache/huggingface
+      HUGGINGFACE_HUB_CACHE: /cache/huggingface/hub
+      TRANSFORMERS_CACHE: /cache/huggingface/transformers
+      VLLM_CACHE_ROOT: /cache/vllm
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ./:/app
+      - hf-cache:/cache/huggingface
+      - vllm-cache:/cache/vllm
+    working_dir: /app
+    entrypoint: ["python3", "run_qa_rule_based_filter.py"]
+
 volumes:
   hf-cache:
     name: shared-hf-cache

@@ -139,6 +139,16 @@ The output row keeps the source record and adds `answer_relevance_reranker.raw_s
 Completed rows are skipped on resume here as well.
 The reranker service uses a dedicated GPU image with its own pinned Hugging Face stack, separate from the `vllm` image.
 
+Rule-based bad-answer filtering on the same translated Polish files:
+
+```bash
+docker compose run --rm qa-rule-based-filter-offline --datasets nq_qa hotpotqa
+```
+
+This reads `out_pl/<dataset>/translated.jsonl` and writes `out_pl/<dataset>/bad_answer_filter_rules.jsonl`.
+The output row keeps the source record and adds a `bad_answer_filter_rules` object with `is_good`, `reasons`, and `reasons_str`.
+Completed rows are skipped on resume here as well.
+
 Optional offline tuning flags:
 - `--offline-tensor-parallel-size`
 - `--offline-gpu-memory-utilization`
@@ -196,10 +206,12 @@ Output files are written inside the repository directory, in separate subfolders
 - `out_pl/nq_qa/translated.jsonl`, `out_pl/nq_qa/failed_rows.jsonl`
 - `out_pl/nq_qa/answer_relevance.jsonl`, `out_pl/nq_qa/answer_relevance_failed_rows.jsonl`
 - `out_pl/nq_qa/bad_answer_filter.jsonl`, `out_pl/nq_qa/bad_answer_filter_failed_rows.jsonl`
+- `out_pl/nq_qa/bad_answer_filter_rules.jsonl`, `out_pl/nq_qa/bad_answer_filter_rules_failed_rows.jsonl`
 - `out_pl/nq_qa/answer_relevance_reranker.jsonl`, `out_pl/nq_qa/answer_relevance_reranker_failed_rows.jsonl`
 - `out_pl/hotpotqa/translated.jsonl`, `out_pl/hotpotqa/failed_rows.jsonl`
 - `out_pl/hotpotqa/answer_relevance.jsonl`, `out_pl/hotpotqa/answer_relevance_failed_rows.jsonl`
 - `out_pl/hotpotqa/bad_answer_filter.jsonl`, `out_pl/hotpotqa/bad_answer_filter_failed_rows.jsonl`
+- `out_pl/hotpotqa/bad_answer_filter_rules.jsonl`, `out_pl/hotpotqa/bad_answer_filter_rules_failed_rows.jsonl`
 - `out_pl/hotpotqa/answer_relevance_reranker.jsonl`, `out_pl/hotpotqa/answer_relevance_reranker_failed_rows.jsonl`
 - `out_pl/msmarco/translated.jsonl`, `out_pl/msmarco/failed_rows.jsonl`, `out_pl/msmarco/checkpoints/*.json`
 - `out_pl/toxic/translated.jsonl`, `out_pl/toxic/failed_rows.jsonl`, `out_pl/toxic/checkpoints/*.json`
@@ -226,8 +238,10 @@ Runtime behavior:
 - use `--failed-jsonl-name <name>` to change the failed-rows file name
 - answer relevance scoring is available for `nq_qa` and `hotpotqa`; it reads translated Polish JSONL files and adds an `answer_relevance` object with structured output fields ordered as `explanation`, then `label`
 - high-precision bad-answer filtering is available for `nq_qa` and `hotpotqa`; run it with `--task bad_answer_filter` or the dedicated `qa-bad-answer-filter*` services, and it writes `bad_answer_filter.jsonl`
+- rule-based bad-answer filtering is available for `nq_qa` and `hotpotqa`; run it with `run_qa_rule_based_filter.py` or the dedicated `qa-rule-based-filter*` services, and it writes `bad_answer_filter_rules.jsonl`
 - use `qa-relevance`, `qa-relevance-external`, or `qa-relevance-offline` services for the QA scoring stage
 - use `qa-bad-answer-filter`, `qa-bad-answer-filter-external`, or `qa-bad-answer-filter-offline` services for the high-precision bad-answer filtering stage
+- use `qa-rule-based-filter` or `qa-rule-based-filter-offline` services for the deterministic rule-based filtering stage
 - reranker scoring is also available for `nq_qa` and `hotpotqa`; it uses `BAAI/bge-reranker-v2.5-gemma2-lightweight` to compute numeric pair scores and writes them to `answer_relevance_reranker.jsonl`
 - if the reranker model download is blocked on Hugging Face, provide `HF_TOKEN` in the environment before running the offline service
 
