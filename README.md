@@ -124,8 +124,10 @@ High-precision bad-answer filtering on the same translated Polish files:
 docker compose run --rm qa-bad-answer-filter-offline --datasets nq_qa hotpotqa
 ```
 
-This reads `out_pl/<dataset>/translated.jsonl` and writes `out_pl/<dataset>/bad_answer_filter.jsonl`.
-The output row keeps the original translated record and adds a `bad_answer_filter` object with `label` and `reason`.
+This reads `out_pl/<dataset>/translated.jsonl` and writes `out_pl/<dataset>/bad_answer_filter_evaluations.jsonl`.
+The output row keeps the original translated record and adds a `bad_answer_filter` object with five structured evaluations:
+`question_language_naturalness`, `answer_language_naturalness`, `answer_entity_integrity`,
+`answer_semantic_coherence`, and `question_answer_meaning_drift`.
 Completed rows are skipped on resume here as well.
 
 Reranker scoring on the same translated Polish files:
@@ -205,12 +207,12 @@ Output files are written inside the repository directory, in separate subfolders
 - `out_pl/nq/translated.jsonl`, `out_pl/nq/failed_rows.jsonl`, `out_pl/nq/checkpoints/*.json`
 - `out_pl/nq_qa/translated.jsonl`, `out_pl/nq_qa/failed_rows.jsonl`
 - `out_pl/nq_qa/answer_relevance.jsonl`, `out_pl/nq_qa/answer_relevance_failed_rows.jsonl`
-- `out_pl/nq_qa/bad_answer_filter.jsonl`, `out_pl/nq_qa/bad_answer_filter_failed_rows.jsonl`
+- `out_pl/nq_qa/bad_answer_filter_evaluations.jsonl`, `out_pl/nq_qa/bad_answer_filter_evaluations_failed_rows.jsonl`
 - `out_pl/nq_qa/bad_answer_filter_rules.jsonl`, `out_pl/nq_qa/bad_answer_filter_rules_failed_rows.jsonl`
 - `out_pl/nq_qa/answer_relevance_reranker.jsonl`, `out_pl/nq_qa/answer_relevance_reranker_failed_rows.jsonl`
 - `out_pl/hotpotqa/translated.jsonl`, `out_pl/hotpotqa/failed_rows.jsonl`
 - `out_pl/hotpotqa/answer_relevance.jsonl`, `out_pl/hotpotqa/answer_relevance_failed_rows.jsonl`
-- `out_pl/hotpotqa/bad_answer_filter.jsonl`, `out_pl/hotpotqa/bad_answer_filter_failed_rows.jsonl`
+- `out_pl/hotpotqa/bad_answer_filter_evaluations.jsonl`, `out_pl/hotpotqa/bad_answer_filter_evaluations_failed_rows.jsonl`
 - `out_pl/hotpotqa/bad_answer_filter_rules.jsonl`, `out_pl/hotpotqa/bad_answer_filter_rules_failed_rows.jsonl`
 - `out_pl/hotpotqa/answer_relevance_reranker.jsonl`, `out_pl/hotpotqa/answer_relevance_reranker_failed_rows.jsonl`
 - `out_pl/msmarco/translated.jsonl`, `out_pl/msmarco/failed_rows.jsonl`, `out_pl/msmarco/checkpoints/*.json`
@@ -237,7 +239,7 @@ Runtime behavior:
 - use `--fail-fast` to stop the entire run on the first failed row
 - use `--failed-jsonl-name <name>` to change the failed-rows file name
 - answer relevance scoring is available for `nq_qa` and `hotpotqa`; it reads translated Polish JSONL files and adds an `answer_relevance` object with structured output fields ordered as `explanation`, then `label`
-- high-precision bad-answer filtering is available for `nq_qa` and `hotpotqa`; run it with `--task bad_answer_filter` or the dedicated `qa-bad-answer-filter*` services, and it writes `bad_answer_filter.jsonl`
+- high-precision bad-answer filtering is available for `nq_qa` and `hotpotqa`; run it with `--task bad_answer_filter` or the dedicated `qa-bad-answer-filter*` services, and it writes `bad_answer_filter_evaluations.jsonl`
 - rule-based bad-answer filtering is available for `nq_qa` and `hotpotqa`; run it with `run_qa_rule_based_filter.py` or the dedicated `qa-rule-based-filter*` services, and it writes `bad_answer_filter_rules.jsonl`
 - use `qa-relevance`, `qa-relevance-external`, or `qa-relevance-offline` services for the QA scoring stage
 - use `qa-bad-answer-filter`, `qa-bad-answer-filter-external`, or `qa-bad-answer-filter-offline` services for the high-precision bad-answer filtering stage

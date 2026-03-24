@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+ 
 import argparse
 import asyncio
 import copy
@@ -12,7 +12,7 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from translation_core import RateLimitReached, append_jsonl, load_done_ids_from_jsonl
 
@@ -22,40 +22,42 @@ ANSWER_RELEVANCE_LABELS = (
     "unclear",
 )
 
-BAD_ANSWER_FILTER_LABELS = (
-    "keep",
-    "reject",
+SCORE_RANGE = (1, 2, 3, 4, 5, 6)
+
+BAD_ANSWER_FILTER_SYSTEM_PROMPT = (
+    "Jestes modulem oceny jakosci tekstu. "
+    "Zwracaj wylacznie JSON zgodny ze schematem odpowiedzi."
 )
 
-ANSWER_RELEVANCE_SYSTEM_PROMPT = """Jesteś klasyfikatorem dopasowania pytanie–odpowiedź dla danych QA.
+ANSWER_RELEVANCE_SYSTEM_PROMPT = """Jestes klasyfikatorem dopasowania pytanie-odpowiedz dla danych QA.
 
-Masz ocenić, czy tekst z pola answer jest sensownym kandydatem odpowiedzi lub poprawnym kontekstem dla tekstu z pola question.
-Nie oceniaj prawdziwości faktograficznej.
-Nie próbuj ustalać, jaki jest faktyczny bieżący rok, dzień, stan świata lub aktualna sytuacja.
-Nie korzystaj z wiedzy zewnętrznej poza tym, co wynika z samego pytania i odpowiedzi.
+Masz ocenic, czy tekst z pola answer jest sensownym kandydatem odpowiedzi lub poprawnym kontekstem dla tekstu z pola question.
+Nie oceniaj prawdziwosci faktograficznej.
+Nie probuj ustalac, jaki jest faktyczny biezacy rok, dzien, stan swiata lub aktualna sytuacja.
+Nie korzystaj z wiedzy zewnetrznej poza tym, co wynika z samego pytania i odpowiedzi.
 
 Oceniaj przede wszystkim:
-- zgodność tematu;
-- zgodność typu oczekiwanej informacji;
-- zgodność głównej encji i relacji;
-- czy odpowiedź nie pochodzi z wyraźnie innego kontekstu.
+- zgodnosc tematu;
+- zgodnosc typu oczekiwanej informacji;
+- zgodnosc glownej encji i relacji;
+- czy odpowiedz nie pochodzi z wyraznie innego kontekstu.
 
-Ważne:
-- Krótkie odpowiedzi, pojedyncze nazwy, daty, liczby i frazy nominalne mogą być poprawne.
-- Odpowiedź nie musi być idealną odpowiedzią końcową; może być także poprawnym i użytecznym kontekstem.
-- Różnice w poziomie szczegółowości nie oznaczają błędu.
-- Wyrażenia względne, takie jak „w tym roku”, „obecnie”, „teraz”, „dzisiaj”, nie powinny same w sobie powodować etykiety negatywnej.
-- Jeśli odpowiedź dotyczy właściwego tematu i relacji, ale może być nie do końca literalnie dopasowana, preferuj `answers_question`.
-- `not_answering_question` wybieraj tylko wtedy, gdy odpowiedź jest wyraźnie z innego tematu, ma zły typ informacji albo myli główną encję/relację.
-- `unclear` używaj rzadko.
+Wazne:
+- Krotkie odpowiedzi, pojedyncze nazwy, daty, liczby i frazy nominalne moga byc poprawne.
+- Odpowiedz nie musi byc idealna odpowiedzia koncowa; moze byc takze poprawnym i uzytecznym kontekstem.
+- Roznice w poziomie szczegolowosci nie oznaczaja bledu.
+- Wyrazenia wzgledne, takie jak "w tym roku", "obecnie", "teraz", "dzisiaj", nie powinny same w sobie powodowac etykiety negatywnej.
+- Jesli odpowiedz dotyczy wlasciwego tematu i relacji, ale moze byc nie do konca literalnie dopasowana, preferuj `answers_question`.
+- `not_answering_question` wybieraj tylko wtedy, gdy odpowiedz jest wyraznie z innego tematu, ma zly typ informacji albo myli glowna encje/relacje.
+- `unclear` uzywaj rzadko.
 
 Etykiety:
-- answers_question: odpowiedź jest sensownym kandydatem odpowiedzi lub poprawnym kontekstem dla pytania;
-- not_answering_question: odpowiedź wyraźnie nie pasuje do pytania;
-- unclear: nie da się wiarygodnie rozstrzygnąć na podstawie samego tekstu.
+- answers_question: odpowiedz jest sensownym kandydatem odpowiedzi lub poprawnym kontekstem dla pytania;
+- not_answering_question: odpowiedz wyraznie nie pasuje do pytania;
+- unclear: nie da sie wiarygodnie rozstrzygnac na podstawie samego tekstu.
 
-Zwracaj wyłącznie JSON zgodny ze schematem.
-Pole explanation musi być pierwsze, a pole label drugie."""
+Zwracaj wylacznie JSON zgodny ze schematem.
+Pole explanation musi byc pierwsze, a pole label drugie."""
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,14 @@ class DatasetSpec:
 class RowResult:
     rid: str
     out_row: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class BadAnswerFilterStage:
+    key: str
+    output_key: str
+    build_prompt: Callable[[str, str], str]
+    build_schema: Callable[[], dict[str, Any]]
 
 
 DATASET_SPECS: dict[str, DatasetSpec] = {
@@ -113,104 +123,277 @@ def build_answer_relevance_schema() -> dict[str, Any]:
     }
 
 
-from typing import Any
+def build_bad_answer_filter_naturalness_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 240,
+            },
+            "score": {
+                "type": "integer",
+                "enum": list(SCORE_RANGE),
+            },
+        },
+        "required": ["reason", "score"],
+        "additionalProperties": False,
+    }
+
+
+def build_bad_answer_filter_entity_integrity_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 240,
+            },
+            "suspicious_items": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "maxLength": 120,
+                },
+                "maxItems": 12,
+            },
+            "score": {
+                "type": "integer",
+                "enum": list(SCORE_RANGE),
+            },
+        },
+        "required": ["reason", "suspicious_items", "score"],
+        "additionalProperties": False,
+    }
+
+
+def build_bad_answer_filter_semantic_coherence_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 240,
+            },
+            "problem_fragments": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "maxLength": 160,
+                },
+                "maxItems": 12,
+            },
+            "score": {
+                "type": "integer",
+                "enum": list(SCORE_RANGE),
+            },
+        },
+        "required": ["reason", "problem_fragments", "score"],
+        "additionalProperties": False,
+    }
+
+
+def build_bad_answer_filter_meaning_drift_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 240,
+            },
+            "shared_meaning_elements": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "maxLength": 120,
+                },
+                "maxItems": 12,
+            },
+            "score": {
+                "type": "integer",
+                "enum": list(SCORE_RANGE),
+            },
+        },
+        "required": ["reason", "shared_meaning_elements", "score"],
+        "additionalProperties": False,
+    }
+
+
+def build_bad_answer_filter_naturalness_prompt(text: str) -> str:
+    return (
+        f"""Oceń naturalność języka polskiego w poniższym tekście.
+Zignoruj prawdziwość informacji i fakty. Oceniaj wyłącznie poprawność i płynność językową.
+
+Skala ocen (1-6):
+1 - Tekst całkowicie niezrozumiały, połamany językowo.
+2 - Bardzo nienaturalny, wygląda jak surowe tłumaczenie maszynowe.
+3 - Wyraźnie nienaturalny (kalki językowe), ale w miarę zrozumiały.
+4 - Zrozumiały, choć zawiera drobne błędy lub sztuczne sformułowania.
+5 - W większości naturalny, sporadyczne potknięcia.
+6 - Całkowicie płynny i naturalny język polski.
+
+Zwróć odpowiedź w formacie JSON (bez dodatkowego tekstu):
+{{
+  "reason": "Krótkie uzasadnienie oceny",
+  "score": <liczba 1-6>
+}}
+
+TEKST:
+{json.dumps(text, ensure_ascii=False)}"""
+    )
+
+
+def build_bad_answer_filter_entity_integrity_prompt(text: str) -> str:
+    return (
+        f"""Oceń poprawność zapisu nazw własnych, skrótów, symboli i terminów technicznych w tekście.
+Szukaj błędów wynikających ze złego tłumaczenia lub formatowania (np. przetłumaczona nazwa własna, skrót zamieniony w zwykłe słowo, uszkodzony wzór). Zignoruj ogólną jakość języka.
+
+Skala ocen (1-6):
+1 - Krytyczne i liczne zniekształcenia najważniejszych terminów/nazw.
+2 - Wyraźne błędy w kluczowych terminach, mocno utrudniające czytanie.
+3 - Zauważalne, podejrzane elementy, uszkodzone pojedyncze nazwy.
+4 - Drobne wątpliwości lub nieścisłości, ale bez silnego wpływu na tekst.
+5 - Niemal brak problemów z terminologią i nazwami.
+6 - Brak jakichkolwiek zniekształceń, idealna terminologia.
+
+Zwróć odpowiedź w formacie JSON:
+{{
+  "reason": "Krótkie uzasadnienie",
+  "suspicious_items": ["element1", "element2"],
+  "score": <liczba 1-6>
+}}
+
+TEKST:
+{json.dumps(text, ensure_ascii=False)}"""
+    )
+
+
+def build_bad_answer_filter_semantic_coherence_prompt(text: str) -> str:
+    return (
+        f"""Oceń wewnętrzną spójność i logikę poniższego tekstu.
+Sprawdź, czy tekst ma sens i nie zaprzecza sam sobie. Nie oceniaj zgodności z zewnętrznymi faktami.
+
+Skala ocen (1-6):
+1 - Tekst pozbawiony sensu, rozpadnięty, pełen sprzeczności.
+2 - Bardzo niespójny, zdania nie łączą się logicznie.
+3 - Wyraźne uszkodzenia sensu i luki logiczne w wielu miejscach.
+4 - Ogólnie zrozumiały, ale zawiera podejrzane lub dziwne fragmenty.
+5 - Spójny tekst, co najwyżej drobne, pomijalne potknięcia.
+6 - W pełni spójny, logiczny i konsekwentny tekst.
+
+Zwróć odpowiedź w formacie JSON:
+{{
+  "reason": "Krótkie uzasadnienie",
+  "problem_fragments": ["fragment 1", "fragment 2"],
+  "score": <liczba 1-6>
+}}
+
+TEKST:
+{json.dumps(text, ensure_ascii=False)}"""
+    )
+
+
+def build_bad_answer_filter_meaning_drift_prompt(anchor: str, answer: str) -> str:
+    return (
+        f"""Oceń powiązanie znaczeniowe (semantyczne) między DOKUMENT_A a DOKUMENT_B.
+Zbadaj, czy tematyka i sens obu tekstów są zgodne. DOKUMENT_B nie musi być pełną odpowiedzią na DOKUMENT_A. Oceniaj wyłącznie, czy doszło do "dryfu" (zmiany tematu, odchylenia znaczenia).
+
+Skala ocen (1-6):
+1 - Zupełnie inne tematy, całkowity rozpad powiązania (silny dryf).
+2 - Słaby związek, tekst B mocno "odpływa" od sensu tekstu A.
+3 - Zauważalna zmiana znaczenia, temat zachowany tylko częściowo.
+4 - Luźny, ale zachowany związek znaczeniowy (niewielki dryf).
+5 - Dobra zgodność głównych myśli i tematów.
+6 - Idealna zgodność znaczeniowa, brak dryfu.
+
+Zwróć odpowiedź w formacie JSON:
+{{
+  "reason": "Krótkie uzasadnienie",
+  "shared_meaning_elements": ["element1", "element2"],
+  "score": <liczba 1-6>
+}}
+
+DOKUMENT_A:
+{json.dumps(anchor, ensure_ascii=False)}
+
+DOKUMENT_B:
+{json.dumps(answer, ensure_ascii=False)}"""
+    )
+
+
+BAD_ANSWER_FILTER_STAGES: tuple[BadAnswerFilterStage, ...] = (
+    BadAnswerFilterStage(
+        key="question_language_naturalness",
+        output_key="question_language_naturalness",
+        build_prompt=lambda question, answer: build_bad_answer_filter_naturalness_prompt(question),
+        build_schema=lambda: build_bad_answer_filter_naturalness_schema(),
+    ),
+    BadAnswerFilterStage(
+        key="answer_language_naturalness",
+        output_key="answer_language_naturalness",
+        build_prompt=lambda question, answer: build_bad_answer_filter_naturalness_prompt(answer),
+        build_schema=lambda: build_bad_answer_filter_naturalness_schema(),
+    ),
+    BadAnswerFilterStage(
+        key="answer_entity_integrity",
+        output_key="answer_entity_integrity",
+        build_prompt=lambda question, answer: build_bad_answer_filter_entity_integrity_prompt(answer),
+        build_schema=lambda: build_bad_answer_filter_entity_integrity_schema(),
+    ),
+    BadAnswerFilterStage(
+        key="answer_semantic_coherence",
+        output_key="answer_semantic_coherence",
+        build_prompt=lambda question, answer: build_bad_answer_filter_semantic_coherence_prompt(answer),
+        build_schema=lambda: build_bad_answer_filter_semantic_coherence_schema(),
+    ),
+    BadAnswerFilterStage(
+        key="question_answer_meaning_drift",
+        output_key="question_answer_meaning_drift",
+        build_prompt=lambda question, answer: build_bad_answer_filter_meaning_drift_prompt(question, answer),
+        build_schema=lambda: build_bad_answer_filter_meaning_drift_schema(),
+    ),
+)
+
 
 def build_bad_answer_filter_schema() -> dict[str, Any]:
     return {
         "type": "object",
         "properties": {
-            "shared_topics": {
-                "type": "array",
-                "description": "Lista wspólnych słów kluczowych, miejsc, osób lub tematów łączących DOKUMENT_A i DOKUMENT_B. Jeśli brak, pusta lista.",
-                "items": {
-                    "type": "string",
-                    "maxLength": 50
-                },
-                "maxItems": 10,
-            },
-            "technical_errors": {
-                "type": "string",
-                "description": "Opis błędów technicznych, echa (powtórzenia 1:1) lub słowo 'brak', jeśli tekst jest poprawny technicznie.",
-                "minLength": 1,
-                "maxLength": 240,
-            },
-            "label": {
-                "type": "string",
-                "enum": list(BAD_ANSWER_FILTER_LABELS),
-            },
+            "question_language_naturalness": build_bad_answer_filter_naturalness_schema(),
+            "answer_language_naturalness": build_bad_answer_filter_naturalness_schema(),
+            "answer_entity_integrity": build_bad_answer_filter_entity_integrity_schema(),
+            "answer_semantic_coherence": build_bad_answer_filter_semantic_coherence_schema(),
+            "question_answer_meaning_drift": build_bad_answer_filter_meaning_drift_schema(),
         },
-        "required": ["shared_topics", "technical_errors", "label"],
+        "required": [stage.output_key for stage in BAD_ANSWER_FILTER_STAGES],
         "additionalProperties": False,
     }
 
 
 def build_answer_relevance_prompt(question: str, answer: str) -> str:
     return (
-        "Oceń, czy `answer` jest sensownym kandydatem odpowiedzi lub poprawnym kontekstem dla `question`.\n"
-        "Nie oceniaj prawdziwości faktograficznej ani aktualności względem świata.\n"
-        "Sprawdź zgodność tematu, typu informacji, głównej encji i relacji.\n"
-        "Nie odrzucaj odpowiedzi tylko dlatego, że pytanie zawiera wyrażenia względne, takie jak `w tym roku`, `obecnie`, `teraz`.\n"
-        "Jeśli odpowiedź jest semantycznie bliska i użyteczna jako para treningowa, wybierz `answers_question`.\n"
-        "Wybierz `not_answering_question` tylko wtedy, gdy odpowiedź jest wyraźnie z innego kontekstu albo ma zły typ informacji.\n"
-        "Użyj `unclear` rzadko.\n\n"
+        "Ocen, czy `answer` jest sensownym kandydatem odpowiedzi lub poprawnym kontekstem dla `question`.\n"
+        "Nie oceniaj prawdziwosci faktograficznej ani aktualnosci wzgledem swiata.\n"
+        "Sprawdz zgodnosc tematu, typu informacji, glownej encji i relacji.\n"
+        "Nie odrzucaj odpowiedzi tylko dlatego, ze pytanie zawiera wyrazenia wzgledne, takie jak `w tym roku`, `obecnie`, `teraz`.\n"
+        "Jesli odpowiedz jest semantycznie bliska i uzyteczna jako para treningowa, wybierz `answers_question`.\n"
+        "Wybierz `not_answering_question` tylko wtedy, gdy odpowiedz jest wyraznie z innego kontekstu albo ma zly typ informacji.\n"
+        "Uzyj `unclear` rzadko.\n\n"
         f"question: {json.dumps(question, ensure_ascii=False)}\n"
         f"answer: {json.dumps(answer, ensure_ascii=False)}"
     )
 
 
-import json
-
-def build_high_precision_bad_answer_prompt(anchor: str, answer: str) -> str:
-    return (
-        f"""Jesteś mechanicznym modułem analizy leksykalnej. Nie jesteś asystentem AI ani weryfikatorem faktów. Ignoruj to, czy DOKUMENT_A jest pytaniem, a DOKUMENT_B odpowiedzią. Twoim jedynym zadaniem jest ocena integralności tekstu oraz nakładania się słownictwa (słów kluczowych, nazw własnych, tematyki).
-
-Odrzuć dane (label: "reject") TYLKO w trzech przypadkach:
-1. BŁĄD TECHNICZNY: DOKUMENT_B ma urwane zdania, niezamknięte nawiasy, nielogiczne ciągi znaków (krzaki).
-2. ECHO: DOKUMENT_B jest w 100% identyczny z DOKUMENT_A (powtórzenie bez nowej treści).
-3. ZEROWY ZWIĄZEK: DOKUMENT_A i DOKUMENT_B nie mają absolutnie żadnych wspólnych słów kluczowych, miejsc, osób ani powiązania tematycznego.
-
-We wszystkich innych przypadkach, gdy występuje choćby luźne powiązanie tematyczne (te same drużyny, osoby, pojęcia), DOKUMENT_B MUSI otrzymać label "keep".
-
-Przykłady:
-
-DOKUMENT_A: "Kto był trenerem Chicago Bear, który był również głównym trenerem drużyny futbolowej University of Pittsburgh w latach 2005-2010?"
-DOKUMENT_B: "Sezon Chicago Bears w 1995 roku był ich 76. regularnym sezonem. Klub zakończył sezon pod kierownictwem Dave’a Wannstedta."
-Wynik: {{"shared_topics":["Chicago Bear", "trener"], "technical_errors": "brak", "label": "keep"}}
-
-DOKUMENT_A: "Który zawodnik, znany jako Sikkimese Sniper, grał dla East Bengal?"
-DOKUMENT_B: "Drugi półfinał Pucharu w 1997 roku odbył się pomiędzy rywalami East Bengal i Mohun Bagan. Mecz wygrał East Bengal 4-1."
-Wynik: {{"shared_topics": ["East Bengal", "mecz", "zawodnik"], "technical_errors": "brak", "label": "keep"}}
-
-DOKUMENT_A: "Walking Down Your Street"
-DOKUMENT_B: "Walking Down Your Street"
-Wynik: {{"shared_topics":[], "technical_errors": "echo - bezsensowne sklonowanie DOKUMENT_A", "label": "reject"}}
-
-DOKUMENT_A: "Chiński film 20 Once Again jest remakiem której południowokoreańskiej komedii?"
-DOKUMENT_B: "20 Once Again (chiń. 重返20岁"
-Wynik: {{"shared_topics":["20 Once Again"], "technical_errors": "ucięty tekst na końcu i niezamknięty nawias", "label": "reject"}}
-
-DOKUMENT_A: "(You Drive Me) Crazy"
-DOKUMENT_B: \"\"\"\"Puss\"/\",\"Puss/Oh, the Guilt \"Puss\"/\"\"\"\"
-Wynik: {{"shared_topics":[], "technical_errors": "krzaki, nadmiar cudzysłowów, szum", "label": "reject"}}
-
-Przeanalizuj poniższą parę w dokładnie taki sam sposób. Najpierw określ błędy techniczne, wypisz wspólne tematy/słowa, a na końcu podejmij decyzję.
-
-DOKUMENT_A:
-{json.dumps(anchor, ensure_ascii=False)}
-
-DOKUMENT_B:
-{json.dumps(answer, ensure_ascii=False)}
-
-Zwróć WYŁĄCZNIE obiekt JSON: {{"shared_topics": [lista_wspolnych_tematow], "technical_errors": "ewentualne_błędy_techniczne", "label": "keep|rejected"}}"""
-    )
-
-
 def task_output_jsonl_name(task: str) -> str:
-    return "bad_answer_filter.jsonl" if task == "bad_answer_filter" else "answer_relevance.jsonl"
+    return "bad_answer_filter_evaluations.jsonl" if task == "bad_answer_filter" else "answer_relevance.jsonl"
 
 
 def task_failed_jsonl_name(task: str) -> str:
-    return "bad_answer_filter_failed_rows.jsonl" if task == "bad_answer_filter" else "answer_relevance_failed_rows.jsonl"
+    return "bad_answer_filter_evaluations_failed_rows.jsonl" if task == "bad_answer_filter" else "answer_relevance_failed_rows.jsonl"
 
 
 def selected_dataset_keys(datasets_arg: list[str]) -> list[str]:
@@ -240,6 +423,18 @@ def read_jsonl_rows(path: str) -> list[dict[str, Any]]:
     return rows
 
 
+def read_jsonl_by_id(path: str) -> dict[str, dict[str, Any]]:
+    if not os.path.exists(path):
+        return {}
+
+    out: dict[str, dict[str, Any]] = {}
+    for row in read_jsonl_rows(path):
+        rid = str(row.get("id") or "").strip()
+        if rid:
+            out[rid] = row
+    return out
+
+
 def resolve_row_id(row: dict[str, Any], dataset_key: str, row_idx: int) -> str:
     rid = str(row.get("id") or "").strip()
     if rid:
@@ -258,64 +453,55 @@ def extract_question_answer(row: dict[str, Any], dataset_key: str) -> tuple[str,
     return question, answer
 
 
-# def build_output_row(
-#     row: dict[str, Any],
-#     label: str,
-#     reason_text: str,
-#     args: argparse.Namespace,
-# ) -> dict[str, Any]:
-#     out_row = dict(row)
-#     if args.task == "bad_answer_filter":
-#         prefix = "bad_answer_filter"
-#         out_row[prefix] = {
-#             "label": label,
-#             "reason": reason_text,
-#         }
-#     else:
-#         prefix = "answer_relevance"
-#         out_row[prefix] = {
-#             "explanation": reason_text,
-#             "label": label,
-#         }
-#     out_row[f"{prefix}_model"] = args.model
-#     out_row[f"{prefix}_source"] = args.inference_source
-#     out_row[f"{prefix}_key_last6"] = args._api_key_last6
-#     out_row[f"{prefix}_base_url"] = args.base_url or None
-#     out_row[f"{prefix}_timestamp_unix"] = int(time.time())
-#     return out_row
+def bad_answer_filter_stage_jsonl_name(stage_key: str) -> str:
+    return f"bad_answer_filter_evaluations.{stage_key}.jsonl"
+
+
+def validate_score_result(result_obj: dict[str, Any], list_field: str | None = None) -> dict[str, Any]:
+    reason = str(result_obj.get("reason") or "").strip()
+    if not reason:
+        raise RuntimeError("Empty reason from model")
+
+    score = result_obj.get("score")
+    if score not in SCORE_RANGE:
+        raise RuntimeError(f"Unsupported score from model: {score!r}")
+
+    if list_field is not None:
+        items = result_obj.get(list_field)
+        if not isinstance(items, list):
+            raise RuntimeError(f"Field {list_field!r} is not a list: {type(items)}")
+        result_obj[list_field] = [str(item).strip() for item in items]
+
+    result_obj["reason"] = reason
+    return result_obj
 
 
 def build_output_row(
-        row: dict[str, Any],
-        label: str,
-        result_obj: dict[str, Any],  # Zmieniamy reason_text na cały obiekt wynikowy
-        args: argparse.Namespace,
+    row: dict[str, Any],
+    label: str,
+    result_obj: dict[str, Any],
+    args: argparse.Namespace,
 ) -> dict[str, Any]:
     out_row = dict(row)
 
     if args.task == "bad_answer_filter":
         prefix = "bad_answer_filter"
         out_row[prefix] = {
-            "label": label,
-            # Zapisujemy nowe, szczegółowe pola zamiast ogólnego 'reason'
-            "technical_errors": result_obj.get("technical_errors"),
-            "shared_topics": result_obj.get("shared_topics"),
+            stage.output_key: result_obj[stage.output_key]
+            for stage in BAD_ANSWER_FILTER_STAGES
         }
     else:
-        # Obsługa innych zadań (np. relevance), które mogą używać 'explanation' lub 'reason'
         prefix = "answer_relevance"
         out_row[prefix] = {
             "explanation": result_obj.get("explanation") or result_obj.get("reason"),
             "label": label,
         }
 
-    # Metadane (bez zmian)
     out_row[f"{prefix}_model"] = args.model
     out_row[f"{prefix}_source"] = args.inference_source
     out_row[f"{prefix}_key_last6"] = args._api_key_last6
     out_row[f"{prefix}_base_url"] = args.base_url or None
     out_row[f"{prefix}_timestamp_unix"] = int(time.time())
-
     return out_row
 
 
@@ -329,55 +515,23 @@ async def process_row(
     deps = runtime_dependencies()
     rid = resolve_row_id(row, dataset_key, row_idx)
     question, answer = extract_question_answer(row, dataset_key)
-    if args.task == "bad_answer_filter":
-        system_prompt = (
-""""""
-        )
-        user_prompt = build_high_precision_bad_answer_prompt(anchor=question, answer=answer)
-        print(f"{user_prompt=}")
-        response_schema = build_bad_answer_filter_schema()
-    else:
-        system_prompt = ANSWER_RELEVANCE_SYSTEM_PROMPT
-        user_prompt = build_answer_relevance_prompt(question=question, answer=answer)
-        response_schema = build_answer_relevance_schema()
     result_obj = await deps["llm_call_json_async"](
         client=client,
         model=args.model,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
+        system_prompt=ANSWER_RELEVANCE_SYSTEM_PROMPT,
+        user_prompt=build_answer_relevance_prompt(question=question, answer=answer),
         temperature=args.temperature,
         max_retries=args.max_retries,
         delay_seconds=args.delay_seconds,
-        response_schema=response_schema,
+        response_schema=build_answer_relevance_schema(),
     )
     label = str(result_obj.get("label") or "").strip()
-    if args.task == "bad_answer_filter":
-        # Pobieramy nowe pola z obiektu wynikowego
-        tech_errors = str(result_obj.get("technical_errors") or "").strip()
-        shared_topics = result_obj.get("shared_topics")
-        label = result_obj.get("label")
-
-        # 1. Walidacja pola z błędami technicznymi
-        if not tech_errors:
-            raise RuntimeError("Model zwrócił pusty opis 'technical_errors'")
-
-        # 2. Walidacja listy tematów wspólnych (Shared Topics)
-        if not isinstance(shared_topics, list):
-            raise RuntimeError(f"Pole 'shared_topics' nie jest listą: {type(shared_topics)}")
-
-        # 3. Walidacja etykiety (label)
-        if label not in BAD_ANSWER_FILTER_LABELS:
-            raise RuntimeError(f"Nieobsługiwana etykieta od modelu: {label!r}")
-    else:
-        reason_text = str(result_obj.get("explanation") or "").strip()
-        if not reason_text:
-            raise RuntimeError("Empty explanation from model")
-        if label not in ANSWER_RELEVANCE_LABELS:
-            raise RuntimeError(f"Unsupported label from model: {label!r}")
-    return RowResult(
-        rid=rid,
-        out_row=build_output_row(row, label, result_obj, args)
-    )
+    reason_text = str(result_obj.get("explanation") or "").strip()
+    if not reason_text:
+        raise RuntimeError("Empty explanation from model")
+    if label not in ANSWER_RELEVANCE_LABELS:
+        raise RuntimeError(f"Unsupported label from model: {label!r}")
+    return RowResult(rid=rid, out_row=build_output_row(row, label, result_obj, args))
 
 
 async def writer_loop(
@@ -402,6 +556,275 @@ async def writer_loop(
         write_errors.append(exc)
 
 
+@asynccontextmanager
+async def build_inference_client(args: argparse.Namespace):
+    deps = runtime_dependencies()
+    if args.inference_source == "offline":
+        offline_client = deps["OfflineVllmClient"](args)
+        try:
+            yield offline_client
+        finally:
+            await offline_client.aclose()
+        return
+
+    from openai import AsyncOpenAI
+
+    async with AsyncOpenAI(api_key=args.api_key, base_url=args.base_url) as api_client:
+        yield api_client
+
+
+async def score_bad_answer_filter_stage_row(
+    row: dict[str, Any],
+    row_idx: int,
+    dataset_key: str,
+    args: argparse.Namespace,
+    client: Any,
+    stage: BadAnswerFilterStage,
+) -> RowResult:
+    deps = runtime_dependencies()
+    rid = resolve_row_id(row, dataset_key, row_idx)
+    question, answer = extract_question_answer(row, dataset_key)
+    result_obj = await deps["llm_call_json_async"](
+        client=client,
+        model=args.model,
+        system_prompt=BAD_ANSWER_FILTER_SYSTEM_PROMPT,
+        user_prompt=stage.build_prompt(question, answer),
+        temperature=args.temperature,
+        max_retries=args.max_retries,
+        delay_seconds=args.delay_seconds,
+        response_schema=stage.build_schema(),
+    )
+
+    if stage.output_key in ("question_language_naturalness", "answer_language_naturalness"):
+        validated_obj = validate_score_result(result_obj)
+    elif stage.output_key == "answer_entity_integrity":
+        validated_obj = validate_score_result(result_obj, "suspicious_items")
+    elif stage.output_key == "answer_semantic_coherence":
+        validated_obj = validate_score_result(result_obj, "problem_fragments")
+    elif stage.output_key == "question_answer_meaning_drift":
+        validated_obj = validate_score_result(result_obj, "shared_meaning_elements")
+    else:
+        raise RuntimeError(f"Unsupported bad-answer-filter stage: {stage.output_key}")
+
+    return RowResult(
+        rid=rid,
+        out_row={
+            "id": rid,
+            "source_dataset": dataset_key,
+            "row_idx": row_idx,
+            stage.output_key: validated_obj,
+        },
+    )
+
+
+def merge_bad_answer_filter_results(
+    row: dict[str, Any],
+    stage_outputs: dict[str, dict[str, Any]],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    aggregate: dict[str, Any] = {}
+    for stage in BAD_ANSWER_FILTER_STAGES:
+        if stage.output_key not in stage_outputs:
+            raise RuntimeError(f"Missing stage output for {stage.output_key}")
+        aggregate[stage.output_key] = stage_outputs[stage.output_key]
+    return build_output_row(row=row, label="", result_obj=aggregate, args=args)
+
+
+async def run_bad_answer_filter_stage_async(
+    args: argparse.Namespace,
+    client: Any,
+    stage: BadAnswerFilterStage,
+    candidates: list[tuple[int, dict[str, Any]]],
+    dataset_dir: str,
+) -> None:
+    from tqdm import tqdm
+
+    deps = runtime_dependencies()
+    stage_jsonl = os.path.join(dataset_dir, bad_answer_filter_stage_jsonl_name(stage.key))
+    failed_jsonl = os.path.join(dataset_dir, f"bad_answer_filter_evaluations.{stage.key}.failed_rows.jsonl")
+    done_ids = load_done_ids_from_jsonl(stage_jsonl)
+    pending = [
+        (row_idx, row)
+        for row_idx, row in candidates
+        if resolve_row_id(row, args.dataset_key, row_idx) not in done_ids
+    ]
+    if not pending:
+        logging.info("Stage %s: nothing to score.", stage.key)
+        return
+
+    effective_parallel = max(1, int(args.parallel_requests))
+    if args.inference_source == "offline":
+        effective_parallel = max(effective_parallel, int(args.offline_micro_batch_size))
+
+    result_queue: asyncio.Queue[RowResult | None] = asyncio.Queue(maxsize=max(4, int(args.parallel_requests) * 2))
+    write_errors: list[BaseException] = []
+    writer = asyncio.create_task(writer_loop(result_queue, stage_jsonl, done_ids, write_errors))
+
+    is_tty = sys.stderr.isatty()
+    show_pbar = args.progress_bar == "on" or (args.progress_bar == "auto" and is_tty)
+    non_tty_progress = not is_tty
+    pbar_rows = tqdm(
+        total=len(pending),
+        desc=f"Stage {stage.key}",
+        unit="row",
+        dynamic_ncols=True,
+        mininterval=0.5,
+        ascii=not is_tty,
+        disable=not show_pbar,
+    )
+    started_at = time.time()
+    completed = 0
+    log_every = max(1, int(args.log_every))
+    sem = asyncio.Semaphore(effective_parallel)
+
+    async def process_with_limit(row_idx: int, row: dict[str, Any]) -> RowResult:
+        async with sem:
+            return await score_bad_answer_filter_stage_row(row, row_idx, args.dataset_key, args, client, stage)
+
+    tasks = [asyncio.create_task(process_with_limit(row_idx, row)) for row_idx, row in pending]
+    task_meta: dict[asyncio.Task[RowResult], tuple[int, str]] = {
+        task: (row_idx, resolve_row_id(row, args.dataset_key, row_idx))
+        for task, (row_idx, row) in zip(tasks, pending)
+    }
+
+    try:
+        pending_tasks = set(tasks)
+        while pending_tasks:
+            if write_errors:
+                raise RuntimeError(f"Writer task failed: {write_errors[0]}") from write_errors[0]
+            done_now, pending_tasks = await asyncio.wait(pending_tasks, return_when=asyncio.FIRST_COMPLETED)
+            for fut in done_now:
+                if write_errors:
+                    raise RuntimeError(f"Writer task failed: {write_errors[0]}") from write_errors[0]
+                try:
+                    result = await fut
+                except RateLimitReached:
+                    await asyncio.sleep(1 + random.random())
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    row_idx, rid = task_meta.get(fut, (-1, "unknown"))
+                    if args.fail_fast:
+                        raise
+                    logging.exception("Stage %s row failed (row_idx=%s id=%s): %s", stage.key, row_idx, rid, exc)
+                    await asyncio.to_thread(
+                        append_jsonl,
+                        failed_jsonl,
+                        {
+                            "id": rid,
+                            "source_dataset": args.dataset_key,
+                            "row_idx": row_idx,
+                            "stage": stage.key,
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                            "timestamp_unix": int(time.time()),
+                        },
+                    )
+                    pbar_rows.update(1)
+                    completed += 1
+                    continue
+
+                await result_queue.put(result)
+                pbar_rows.update(1)
+                completed += 1
+                if (non_tty_progress and not show_pbar) and (
+                    completed == 1 or completed % log_every == 0 or completed == len(pending)
+                ):
+                    elapsed = time.time() - started_at
+                    rate = completed / elapsed if elapsed > 0 else 0.0
+                    eta_seconds = (len(pending) - completed) / rate if rate > 0 else 0.0
+                    logging.info(
+                        "Stage %s progress: %d/%d rows (%.1f%%), rate=%.2f row/s, elapsed=%s, eta=%s",
+                        stage.key,
+                        completed,
+                        len(pending),
+                        100.0 * completed / len(pending),
+                        rate,
+                        deps["format_seconds"](elapsed),
+                        deps["format_seconds"](eta_seconds),
+                    )
+
+        await result_queue.join()
+        if write_errors:
+            raise RuntimeError(f"Writer task failed: {write_errors[0]}") from write_errors[0]
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        pbar_rows.close()
+        await result_queue.put(None)
+        try:
+            await asyncio.wait_for(writer, timeout=10)
+        except asyncio.TimeoutError:
+            writer.cancel()
+            await asyncio.gather(writer, return_exceptions=True)
+
+
+async def run_bad_answer_filter_dataset_async(args: argparse.Namespace) -> int:
+    dataset_dir = os.path.join(args.out_dir, args.dataset_key)
+    input_jsonl = os.path.join(dataset_dir, args.input_jsonl_name)
+    out_jsonl = os.path.join(dataset_dir, args.out_jsonl_name)
+    os.makedirs(dataset_dir, exist_ok=True)
+
+    rows = read_jsonl_rows(input_jsonl)
+    total = len(rows)
+    skip = max(0, int(args.skip_rows))
+    if skip >= total:
+        print(f"--skip-rows={skip} >= dataset size={total}. Nothing to do.")
+        return 0
+
+    end_idx = min(total, skip + int(args.max_rows)) if args.max_rows and args.max_rows > 0 else total
+    final_done_ids = load_done_ids_from_jsonl(out_jsonl)
+    candidates: list[tuple[int, dict[str, Any]]] = []
+    for row_idx in range(skip, end_idx):
+        row = rows[row_idx]
+        rid = resolve_row_id(row, args.dataset_key, row_idx)
+        if rid in final_done_ids:
+            continue
+        candidates.append((row_idx, row))
+
+    if not candidates:
+        print("Nothing to score (all rows already done in selected window).")
+        return 0
+
+    async with build_inference_client(args) as client:
+        for stage in BAD_ANSWER_FILTER_STAGES:
+            await run_bad_answer_filter_stage_async(args, client, stage, candidates, dataset_dir)
+
+    stage_results: dict[str, dict[str, dict[str, Any]]] = {}
+    for stage in BAD_ANSWER_FILTER_STAGES:
+        stage_path = os.path.join(dataset_dir, bad_answer_filter_stage_jsonl_name(stage.key))
+        stage_rows = read_jsonl_by_id(stage_path)
+        stage_results[stage.output_key] = {
+            rid: row[stage.output_key]
+            for rid, row in stage_rows.items()
+            if stage.output_key in row
+        }
+
+    final_done_ids = load_done_ids_from_jsonl(out_jsonl)
+    for row_idx, row in candidates:
+        rid = resolve_row_id(row, args.dataset_key, row_idx)
+        if rid in final_done_ids:
+            continue
+        merged_stage_outputs: dict[str, dict[str, Any]] = {}
+        missing_stage = None
+        for stage in BAD_ANSWER_FILTER_STAGES:
+            stage_output = stage_results.get(stage.output_key, {}).get(rid)
+            if stage_output is None:
+                missing_stage = stage.output_key
+                break
+            merged_stage_outputs[stage.output_key] = stage_output
+        if missing_stage is not None:
+            logging.warning("Skipping final merge for id=%s because stage %s is missing.", rid, missing_stage)
+            continue
+        append_jsonl(out_jsonl, merge_bad_answer_filter_results(row=row, stage_outputs=merged_stage_outputs, args=args))
+        final_done_ids.add(rid)
+
+    logging.info("Bad-answer evaluation merge finished. Output: %s", out_jsonl)
+    return 0
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
@@ -415,16 +838,8 @@ def parse_args() -> argparse.Namespace:
         choices=["vllm", "external", "offline"],
         help="Inference source: local vLLM API server, external OpenAI-compatible API, or offline vLLM engine.",
     )
-    p.add_argument(
-        "--base-url",
-        default=None,
-        help="Override API base URL. If omitted, resolves from mode-specific env vars.",
-    )
-    p.add_argument(
-        "--api-key",
-        default=None,
-        help="Override API key. If omitted, resolves from mode-specific env vars.",
-    )
+    p.add_argument("--base-url", default=None, help="Override API base URL. If omitted, resolves from mode-specific env vars.")
+    p.add_argument("--api-key", default=None, help="Override API key. If omitted, resolves from mode-specific env vars.")
     p.add_argument("--model", default=os.getenv("MODEL_NAME"), required=os.getenv("MODEL_NAME") is None)
     p.add_argument("--parallel-requests", type=int, default=int(os.getenv("PARALLEL_REQUESTS", "2")))
     p.add_argument(
@@ -483,11 +898,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--delay-seconds", type=float, default=0.0)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--max-retries", type=int, default=1)
-    p.add_argument(
-        "--fail-fast",
-        action="store_true",
-        help="Stop whole run on first row-level scoring error.",
-    )
+    p.add_argument("--fail-fast", action="store_true", help="Stop whole run on first row-level scoring error.")
     p.add_argument(
         "--datasets",
         nargs="+",
@@ -499,17 +910,13 @@ def parse_args() -> argparse.Namespace:
         "--task",
         default="answer_relevance",
         choices=["answer_relevance", "bad_answer_filter"],
-        help="Scoring task: answer relevance classifier or high-precision bad-answer filter.",
+        help="Scoring task: answer relevance classifier or multi-stage bad-answer evaluation.",
     )
     p.add_argument("--out-dir", default="out_pl")
     p.add_argument("--input-jsonl-name", default="translated.jsonl")
     p.add_argument("--out-jsonl-name", default=None)
     p.add_argument("--failed-jsonl-name", default=None)
-    p.add_argument(
-        "--retry-failed-rows",
-        action="store_true",
-        help="Include rows previously present in failed_rows JSONL when resuming.",
-    )
+    p.add_argument("--retry-failed-rows", action="store_true", help="Include rows previously present in failed_rows JSONL when resuming.")
     p.add_argument("--max-rows", type=int, default=0, help="0 = all")
     p.add_argument("--skip-rows", type=int, default=0)
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -525,6 +932,9 @@ def parse_args() -> argparse.Namespace:
 
 async def run_single_dataset_async(args: argparse.Namespace) -> int:
     from tqdm import tqdm
+
+    if args.task == "bad_answer_filter":
+        return await run_bad_answer_filter_dataset_async(args)
 
     deps = runtime_dependencies()
     dataset_dir = os.path.join(args.out_dir, args.dataset_key)
@@ -570,33 +980,9 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
     if args.inference_source == "offline":
         effective_parallel = max(effective_parallel, int(args.offline_micro_batch_size))
 
-    logging.info(
-        "Answer relevance run: source=%s dataset_key=%s input=%s output=%s model=%s parallel=%d offline_micro_batch=%d "
-        "range=%d..%d total_in_range=%d pending=%d done_before=%d skipped_failed=%d retry_failed_rows=%s",
-        args.inference_source,
-        args.dataset_key,
-        input_jsonl,
-        out_jsonl,
-        args.model,
-        effective_parallel,
-        int(args.offline_micro_batch_size),
-        skip,
-        end_idx - 1,
-        end_idx - skip,
-        len(candidates),
-        (end_idx - skip) - len(candidates),
-        skipped_failed,
-        bool(args.retry_failed_rows),
-    )
-
-    result_queue: asyncio.Queue[RowResult | None] = asyncio.Queue(
-        maxsize=max(4, int(args.parallel_requests) * 2)
-    )
+    result_queue: asyncio.Queue[RowResult | None] = asyncio.Queue(maxsize=max(4, int(args.parallel_requests) * 2))
     write_errors: list[BaseException] = []
-
     writer = asyncio.create_task(writer_loop(result_queue, out_jsonl, done_ids, write_errors))
-    logging.info("Writer task started. Output: %s", out_jsonl)
-    logging.info("Failed rows will be appended to: %s", failed_jsonl)
 
     is_tty = sys.stderr.isatty()
     show_pbar = args.progress_bar == "on" or (args.progress_bar == "auto" and is_tty)
@@ -615,22 +1001,7 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
     log_every = max(1, int(args.log_every))
     sem = asyncio.Semaphore(effective_parallel)
 
-    @asynccontextmanager
-    async def build_inference_client():
-        if args.inference_source == "offline":
-            offline_client = deps["OfflineVllmClient"](args)
-            try:
-                yield offline_client
-            finally:
-                await offline_client.aclose()
-            return
-
-        from openai import AsyncOpenAI
-
-        async with AsyncOpenAI(api_key=args.api_key, base_url=args.base_url) as api_client:
-            yield api_client
-
-    async with build_inference_client() as client:
+    async with build_inference_client(args) as client:
         async def process_with_limit(row_idx: int, row: dict[str, Any]) -> RowResult:
             async with sem:
                 return await process_row(row, row_idx, args.dataset_key, args, client)
@@ -646,10 +1017,7 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
             while pending_tasks:
                 if write_errors:
                     raise RuntimeError(f"Writer task failed: {write_errors[0]}") from write_errors[0]
-                done_now, pending_tasks = await asyncio.wait(
-                    pending_tasks,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
+                done_now, pending_tasks = await asyncio.wait(pending_tasks, return_when=asyncio.FIRST_COMPLETED)
                 for fut in done_now:
                     if write_errors:
                         raise RuntimeError(f"Writer task failed: {write_errors[0]}") from write_errors[0]
@@ -663,17 +1031,19 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
                         failed_rows += 1
                         if args.fail_fast:
                             raise
-
                         logging.exception("Row failed (row_idx=%s id=%s): %s", row_idx, rid, exc)
-                        failed_obj = {
-                            "id": rid,
-                            "source_dataset": args.dataset_key,
-                            "row_idx": row_idx,
-                            "error": str(exc),
-                            "error_type": type(exc).__name__,
-                            "timestamp_unix": int(time.time()),
-                        }
-                        await asyncio.to_thread(append_jsonl, failed_jsonl, failed_obj)
+                        await asyncio.to_thread(
+                            append_jsonl,
+                            failed_jsonl,
+                            {
+                                "id": rid,
+                                "source_dataset": args.dataset_key,
+                                "row_idx": row_idx,
+                                "error": str(exc),
+                                "error_type": type(exc).__name__,
+                                "timestamp_unix": int(time.time()),
+                            },
+                        )
                         pbar_rows.update(1)
                         completed += 1
                         continue
@@ -730,18 +1100,9 @@ async def run_async(args: argparse.Namespace) -> int:
     if args.failed_jsonl_name is None:
         args.failed_jsonl_name = task_failed_jsonl_name(args.task)
 
-    selected_keys = selected_dataset_keys(args.datasets)
-    logging.info("Selected dataset runs: %s", ", ".join(selected_keys))
-
-    for dataset_key in selected_keys:
+    for dataset_key in selected_dataset_keys(args.datasets):
         run_args = copy.deepcopy(args)
         run_args.dataset_key = dataset_key
-        logging.info(
-            "Starting answer relevance run: key=%s out_dir=%s input_jsonl=%s",
-            dataset_key,
-            os.path.join(args.out_dir, dataset_key),
-            args.input_jsonl_name,
-        )
         rc = await run_single_dataset_async(run_args)
         if rc != 0:
             return rc
