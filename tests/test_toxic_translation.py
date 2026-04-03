@@ -43,7 +43,7 @@ if "tqdm" not in sys.modules:
     tqdm_stub.tqdm = lambda *args, **kwargs: None
     sys.modules["tqdm"] = tqdm_stub
 
-from run_translation_vllm import (  # noqa: E402
+from run_translation import (  # noqa: E402
     TOXIC_LABEL_COLUMNS,
     build_shared_few_shot_examples_by_rid,
     build_out_row_from_state_hotpotqa,
@@ -165,7 +165,7 @@ def test_load_dataset_for_run_maps_wildguard_train_to_config(monkeypatch) -> Non
         called["kwargs"] = kwargs
         return "ok"
 
-    monkeypatch.setattr("run_translation_vllm.load_dataset", fake_load_dataset)
+    monkeypatch.setattr("run_translation.load_dataset", fake_load_dataset)
 
     out = load_dataset_for_run("allenai/wildguardmix", "wildguard", "train", "hf_xxx")
     assert out == "ok"
@@ -183,7 +183,7 @@ def test_load_dataset_for_run_maps_wildguard_test_to_config(monkeypatch) -> None
         called["kwargs"] = kwargs
         return "ok"
 
-    monkeypatch.setattr("run_translation_vllm.load_dataset", fake_load_dataset)
+    monkeypatch.setattr("run_translation.load_dataset", fake_load_dataset)
 
     out = load_dataset_for_run("allenai/wildguardmix", "wildguard", "test", None)
     assert out == "ok"
@@ -205,7 +205,7 @@ def test_load_dataset_for_run_maps_hotpotqa_to_default_triplet_config(monkeypatc
         called["kwargs"] = kwargs
         return "ok"
 
-    monkeypatch.setattr("run_translation_vllm.load_dataset", fake_load_dataset)
+    monkeypatch.setattr("run_translation.load_dataset", fake_load_dataset)
 
     out = load_dataset_for_run("sentence-transformers/hotpotqa", "hotpotqa", "train", "hf_xxx")
     assert out == "ok"
@@ -504,7 +504,7 @@ def test_build_shared_few_shot_examples_by_rid_reuses_examples_for_blocks_of_ten
         calls.append((examples_path, example_count, group_no))
         return [{"query_text": f"q{group_no}", "phrase_pl": f"p{group_no}", "doc_text": f"d{group_no}", "document_pl": f"a{group_no}"}]
 
-    monkeypatch.setattr("run_translation_vllm.sample_few_shot_translation_examples", fake_sample_few_shot_translation_examples)
+    monkeypatch.setattr("run_translation.sample_few_shot_translation_examples", fake_sample_few_shot_translation_examples)
 
     candidates = [(idx, {"id": f"row-{idx}"}) for idx in range(23)]
     out = build_shared_few_shot_examples_by_rid(
@@ -530,7 +530,7 @@ def test_build_shared_few_shot_examples_by_rid_returns_empty_for_no_few_shot(mon
         called["count"] += 1
         return [{"query_text": "q", "phrase_pl": "p", "doc_text": "d", "document_pl": "a"}]
 
-    monkeypatch.setattr("run_translation_vllm.sample_few_shot_translation_examples", fake_sample_few_shot_translation_examples)
+    monkeypatch.setattr("run_translation.sample_few_shot_translation_examples", fake_sample_few_shot_translation_examples)
 
     out = build_shared_few_shot_examples_by_rid(
         candidates=[(0, {"id": "row-0"})],

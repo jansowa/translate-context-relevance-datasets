@@ -64,7 +64,7 @@ services:
     volumes:
       - ./:/app
     working_dir: /app
-    entrypoint: ["python", "run_translation_vllm.py"]
+    entrypoint: ["python", "run_translation.py"]
 
   translator-external:
     build:
@@ -75,7 +75,7 @@ services:
     volumes:
       - ./:/app
     working_dir: /app
-    entrypoint: ["python", "run_translation_vllm.py"]
+    entrypoint: ["python", "run_translation.py"]
 
   qa-relevance:
     build:
@@ -154,7 +154,7 @@ services:
       - hf-cache:/cache/huggingface
       - vllm-cache:/cache/vllm
     working_dir: /app
-    entrypoint: ["python3", "run_translation_vllm.py", "--inference-source", "offline"]
+    entrypoint: ["python3", "run_translation.py", "--inference-source", "offline"]
 
   qa-relevance-offline:
     build:

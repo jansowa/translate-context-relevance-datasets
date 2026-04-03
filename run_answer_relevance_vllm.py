@@ -87,7 +87,7 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
 
 
 def runtime_dependencies() -> dict[str, Any]:
-    from run_translation_vllm import (
+    from run_translation import (
         OfflineVllmClient,
         format_seconds,
         llm_call_json_async,

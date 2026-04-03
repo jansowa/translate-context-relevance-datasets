@@ -301,4 +301,4 @@ The repository still includes the original script:
 
 - `translate_context_relevance_dataset.py`
 
-It is kept as a legacy/compatibility runner alongside `run_translation_vllm.py`.
+It is kept as a legacy/compatibility runner alongside `run_translation.py`.
