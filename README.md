@@ -133,7 +133,7 @@ To additionally enable the optional `answer_entity_integrity` prompt, run:
 docker compose run --rm qa-bad-answer-filter-offline --datasets nq_qa hotpotqa --enable-entity-integrity
 ```
 
-Completed rows are skipped on resume here as well.
+Completed rows are skipped on resume here as well. Rows present in the corresponding `failed_rows` JSONL are also skipped by default on resume; add `--retry-failed-rows` to include them again.
 
 You can also run the same bad-answer filter on any custom JSONL file:
 
@@ -159,7 +159,7 @@ docker compose run --rm qa-reranker-offline --datasets nq_qa hotpotqa
 
 This uses `BAAI/bge-reranker-v2.5-gemma2-lightweight` and writes `out_pl/<dataset>/answer_relevance_reranker.jsonl`.
 The output row keeps the source record and adds `answer_relevance_reranker.raw_score` plus `answer_relevance_reranker.sigmoid_score`.
-Completed rows are skipped on resume here as well.
+Completed rows are skipped on resume here as well. Rows present in the corresponding `failed_rows` JSONL are also skipped by default on resume; add `--retry-failed-rows` to include them again.
 The reranker service uses a dedicated GPU image with its own pinned Hugging Face stack, separate from the `vllm` image.
 
 You can also run the reranker on any custom JSONL file:
@@ -180,7 +180,7 @@ docker compose run --rm qa-rule-based-filter-offline --datasets nq_qa hotpotqa
 
 This reads `out_pl/<dataset>/translated.jsonl` and writes `out_pl/<dataset>/bad_answer_filter_rules.jsonl`.
 The output row keeps the source record and adds a `bad_answer_filter_rules` object with `is_good`, `reasons`, and `reasons_str`.
-Completed rows are skipped on resume here as well.
+Completed rows are skipped on resume here as well. Rows present in the corresponding `failed_rows` JSONL are also skipped by default on resume; add `--retry-failed-rows` to include them again.
 
 You can also run the rule-based filter on any custom JSONL file:
 
@@ -317,6 +317,7 @@ Runtime behavior:
 - for `hotpotqa`, only `anchor` and `positive` are translated; `negative` is copied through unchanged in English
 - `hotpotqa` is loaded with the default Hugging Face config `triplet`
 - row-level failures do not stop the whole run by default; they are logged to `<out-dir>/<dataset_key>/failed_rows.jsonl`
+- for QA filter/reranker/bad-answer-filter resume flows, rows already present in the corresponding `failed_rows` JSONL are skipped by default; add `--retry-failed-rows` to retry them
 - use `--fail-fast` to stop the entire run on the first failed row
 - use `--failed-jsonl-name <name>` to change the failed-rows file name
 - answer relevance scoring is available for `nq_qa` and `hotpotqa`; it reads translated Polish JSONL files and adds an `answer_relevance` object with structured output fields ordered as `explanation`, then `label`

@@ -839,13 +839,22 @@ async def run_bad_answer_filter_stage_async(
         stage_jsonl = os.path.join(dataset_dir, bad_answer_filter_stage_jsonl_name(stage.key))
         failed_jsonl = os.path.join(dataset_dir, f"bad_answer_filter_evaluations.{stage.key}.failed_rows.jsonl")
     done_ids = load_done_ids_from_jsonl(stage_jsonl)
+    failed_ids = set() if args.retry_failed_rows else load_done_ids_from_jsonl(failed_jsonl)
     pending = [
         (row_idx, row)
         for row_idx, row in candidates
         if resolve_row_id(row, args.dataset_key, row_idx) not in done_ids
+        and resolve_row_id(row, args.dataset_key, row_idx) not in failed_ids
     ]
     if not pending:
-        logging.info("Stage %s: nothing to score.", stage.key)
+        if failed_ids:
+            logging.info(
+                "Stage %s: nothing to score (rows already done or skipped because they are present in failed_rows). "
+                "Use --retry-failed-rows to include failed rows.",
+                stage.key,
+            )
+        else:
+            logging.info("Stage %s: nothing to score.", stage.key)
         return
 
     effective_parallel = max(1, int(args.parallel_requests))
