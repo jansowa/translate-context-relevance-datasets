@@ -73,6 +73,16 @@ def test_extract_custom_jsonl_questions_answers_supports_lists_and_priority() ->
     assert answers == ["Odpowiedz A", "Odpowiedz B"]
 
 
+def test_extract_custom_jsonl_questions_answers_supports_question_answers_fields() -> None:
+    row = {
+        "question": "Pytanie z gotowego polskiego zbioru",
+        "answers": ["Odpowiedz 1", "Odpowiedz 2"],
+    }
+    questions, answers = extract_custom_jsonl_questions_answers(row)
+    assert questions == ["Pytanie z gotowego polskiego zbioru"]
+    assert answers == ["Odpowiedz 1", "Odpowiedz 2"]
+
+
 def test_extract_custom_jsonl_questions_answers_filters_empty_strings() -> None:
     row = {
         "anchors": ["", "  ", "Pytanie"],
@@ -305,6 +315,10 @@ def test_resolve_input_output_paths_uses_custom_jsonl_paths() -> None:
 
 def test_selected_dataset_keys_expands_all_without_duplicates() -> None:
     assert selected_dataset_keys(["all", "nq_qa"]) == ["nq_qa", "hotpotqa"]
+
+
+def test_selected_dataset_keys_accepts_explicit_clarin_ms_marco() -> None:
+    assert selected_dataset_keys(["clarin-ms-marco", "nq_qa"]) == ["clarin-ms-marco", "nq_qa"]
 
 
 def test_task_specific_output_names() -> None:

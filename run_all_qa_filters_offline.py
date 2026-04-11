@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from clarin_ms_marco import CLARIN_MS_MARCO_DATASET_KEY, ensure_clarin_ms_marco_jsonl
 from run_answer_relevance_reranker import custom_output_jsonl_name as reranker_output_jsonl_name
 from run_answer_relevance_vllm import custom_bad_answer_filter_output_jsonl_name
 from run_merge_qa_outputs import merge_rows_by_id, write_jsonl
@@ -53,20 +54,36 @@ def cleanup_intermediate_outputs(input_jsonl_path: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Run rule-based filter, reranker, and bad-answer filter on a custom JSONL file, then merge outputs."
+        description=(
+            "Run rule-based filter, reranker, and bad-answer filter on a custom JSONL file "
+            "or on the clarin-ms-marco dataset alias, then merge outputs."
+        )
     )
-    p.add_argument("--input-jsonl-path", required=True, help="Path to a custom JSONL file.")
+    p.add_argument("--input-jsonl-path", default=None, help="Path to a custom JSONL file.")
+    p.add_argument(
+        "--datasets",
+        nargs="+",
+        default=None,
+        choices=[CLARIN_MS_MARCO_DATASET_KEY],
+        help="Dataset aliases supported by the combined offline QA filters runner.",
+    )
     p.add_argument(
         "--merged-out-jsonl-path",
         default=None,
         help="Optional output path for the merged final JSONL. Default: <stem>-filters.jsonl next to the input.",
     )
+    p.add_argument("--out-dir", default="out_pl", help="Base output directory used for dataset aliases.")
     p.add_argument(
         "--enable-entity-integrity",
         action="store_true",
         help="Forwarded to qa-bad-answer-filter-offline stage.",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if bool(args.input_jsonl_path) == bool(args.datasets):
+        raise RuntimeError("Use exactly one of --input-jsonl-path or --datasets")
+    if args.datasets and len(args.datasets) != 1:
+        raise RuntimeError("qa-all-filters-offline currently supports exactly one dataset alias at a time")
+    return args
 
 
 def run_command(command: list[str]) -> None:
@@ -83,8 +100,9 @@ def main() -> int:
         force=True,
     )
 
+    input_jsonl_path = args.input_jsonl_path or ensure_clarin_ms_marco_jsonl(args.out_dir)
     base_command = [sys.executable]
-    input_args = ["--input-jsonl-path", args.input_jsonl_path]
+    input_args = ["--input-jsonl-path", input_jsonl_path]
 
     run_command(base_command + ["run_qa_rule_based_filter.py", *input_args])
     run_command(base_command + ["run_answer_relevance_reranker.py", *input_args])
@@ -102,8 +120,8 @@ def main() -> int:
         bad_answer_command.append("--enable-entity-integrity")
     run_command(bad_answer_command)
 
-    merged_path = merge_custom_filter_outputs(args.input_jsonl_path, args.merged_out_jsonl_path)
-    cleanup_intermediate_outputs(args.input_jsonl_path)
+    merged_path = merge_custom_filter_outputs(input_jsonl_path, args.merged_out_jsonl_path)
+    cleanup_intermediate_outputs(input_jsonl_path)
     logging.info("Merged filter output written to %s", merged_path)
     return 0
 

@@ -12,6 +12,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from clarin_ms_marco import (
+    CLARIN_MS_MARCO_DATASET_KEY,
+    configure_custom_jsonl_run_args,
+    ensure_clarin_ms_marco_jsonl,
+)
 from tqdm import tqdm
 
 from qa_rule_based_filter import evaluate_row
@@ -130,7 +135,7 @@ def parse_args() -> argparse.Namespace:
         "--datasets",
         nargs="+",
         default=["all"],
-        choices=["all", "nq_qa", "hotpotqa"],
+        choices=["all", "nq_qa", "hotpotqa", CLARIN_MS_MARCO_DATASET_KEY],
         help="Dataset selection. 'all' expands to nq_qa and hotpotqa.",
     )
     p.add_argument("--out-dir", default="out_pl")
@@ -300,12 +305,16 @@ def main() -> int:
 
     for dataset_key in selected_keys:
         run_args = copy.deepcopy(args)
-        run_args.dataset_key = dataset_key
+        if dataset_key == CLARIN_MS_MARCO_DATASET_KEY:
+            input_jsonl_path = ensure_clarin_ms_marco_jsonl(args.out_dir)
+            run_args = configure_custom_jsonl_run_args(run_args, input_jsonl_path, CUSTOM_JSONL_DATASET_KEY)
+        else:
+            run_args.dataset_key = dataset_key
         logging.info(
             "Starting rule-based QA filter run: key=%s out_dir=%s input_jsonl=%s",
             dataset_key,
-            str(Path(args.input_jsonl_path).parent) if dataset_key == CUSTOM_JSONL_DATASET_KEY else os.path.join(args.out_dir, dataset_key),
-            args.input_jsonl_path or args.input_jsonl_name,
+            str(Path(run_args.input_jsonl_path).parent) if run_args.dataset_key == CUSTOM_JSONL_DATASET_KEY else os.path.join(args.out_dir, dataset_key),
+            run_args.input_jsonl_path or args.input_jsonl_name,
         )
         rc = run_single_dataset(run_args)
         if rc != 0:

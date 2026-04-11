@@ -15,6 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from clarin_ms_marco import (
+    CLARIN_MS_MARCO_DATASET_KEY,
+    configure_custom_jsonl_run_args,
+    ensure_clarin_ms_marco_jsonl,
+)
 from translation_core import RateLimitReached, append_jsonl, load_done_ids_from_jsonl
 
 ANSWER_RELEVANCE_LABELS = (
@@ -87,7 +92,7 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
 }
 
 CUSTOM_JSONL_DATASET_KEY = "custom_jsonl"
-CUSTOM_JSONL_QUESTION_FIELDS = ("anchor", "anchors", "query", "queries")
+CUSTOM_JSONL_QUESTION_FIELDS = ("question", "questions", "anchor", "anchors", "query", "queries")
 CUSTOM_JSONL_ANSWER_FIELDS = ("positive", "positives", "answer", "answers", "response", "responses")
 
 
@@ -1123,7 +1128,7 @@ def parse_args() -> argparse.Namespace:
         "--datasets",
         nargs="+",
         default=["all"],
-        choices=["all", *DATASET_SPECS.keys()],
+        choices=["all", *DATASET_SPECS.keys(), CLARIN_MS_MARCO_DATASET_KEY],
         help="Dataset selection. 'all' expands to nq_qa and hotpotqa.",
     )
     p.add_argument(
@@ -1335,7 +1340,11 @@ async def run_async(args: argparse.Namespace) -> int:
 
     for dataset_key in selected_dataset_keys(args.datasets):
         run_args = copy.deepcopy(args)
-        run_args.dataset_key = dataset_key
+        if dataset_key == CLARIN_MS_MARCO_DATASET_KEY:
+            input_jsonl_path = ensure_clarin_ms_marco_jsonl(args.out_dir)
+            run_args = configure_custom_jsonl_run_args(run_args, input_jsonl_path, CUSTOM_JSONL_DATASET_KEY)
+        else:
+            run_args.dataset_key = dataset_key
         rc = await run_single_dataset_async(run_args)
         if rc != 0:
             return rc

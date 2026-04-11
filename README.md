@@ -142,7 +142,7 @@ docker compose run --rm qa-bad-answer-filter-offline --task bad_answer_filter --
 ```
 
 In custom JSONL mode, the runner looks for the first non-empty question field from:
-`anchor`, `anchors`, `query`, `queries`
+`question`, `questions`, `anchor`, `anchors`, `query`, `queries`
 and the first non-empty answer field from:
 `positive`, `positives`, `answer`, `answers`, `response`, `responses`.
 Each field may be either a string or a list of strings.
@@ -150,6 +150,14 @@ If a row contains multiple questions and multiple answers, the filter evaluates 
 The output is written next to the input file as `<stem>.bad_answer_filter_evaluations.jsonl`, and each output row contains `bad_answer_filter_pairs` with:
 `pair_index`, `question`, `answer`, and `bad_answer_filter` for that pair.
 The optional `--enable-entity-integrity` flag works in custom JSONL mode as well.
+
+You can also run the bad-answer filter on the Polish `clarin-ms-marco` dataset alias:
+
+```bash
+docker compose run --rm qa-bad-answer-filter-offline --datasets clarin-ms-marco
+```
+
+On the first run, the project materializes `out_pl/clarin-ms-marco/translated.jsonl` from Hugging Face and reuses it on later runs.
 
 Reranker scoring on the same translated Polish files:
 
@@ -172,6 +180,16 @@ In custom JSONL mode, the same field aliases are supported as for `qa-bad-answer
 If a row contains multiple questions and multiple answers, the reranker evaluates the full Cartesian product and writes the result next to the input file as `<stem>.answer_relevance_reranker.jsonl`.
 Each output row contains `answer_relevance_reranker_pairs` with `pair_index`, `question`, `answer`, and `answer_relevance_reranker`.
 
+You can also run the reranker on the Polish `clarin-ms-marco` dataset alias:
+
+```bash
+docker compose run --rm qa-reranker-offline --datasets clarin-ms-marco
+```
+
+On the first run, the project downloads `clarin-knext/msmarco-pl` plus `clarin-knext/msmarco-pl-qrels` and materializes
+`out_pl/clarin-ms-marco/translated.jsonl`. Each row contains `question`, `question_id`, `answers`, and `answer_ids`.
+Later runs reuse the same JSONL instead of rebuilding it.
+
 Rule-based bad-answer filtering on the same translated Polish files:
 
 ```bash
@@ -192,6 +210,12 @@ In custom JSONL mode, the same field aliases are supported as for `qa-bad-answer
 If a row contains multiple questions and multiple answers, the rule-based filter evaluates the full Cartesian product and writes the result next to the input file as `<stem>.bad_answer_filter_rules.jsonl`.
 Each output row contains `bad_answer_filter_rules_pairs` with `pair_index`, `question`, `answer`, and `bad_answer_filter_rules`.
 
+You can also run the rule-based filter on the Polish `clarin-ms-marco` dataset alias:
+
+```bash
+docker compose run --rm qa-rule-based-filter-offline --datasets clarin-ms-marco
+```
+
 Run all three offline QA filters in one command, in this order:
 1. `qa-rule-based-filter-offline`
 2. `qa-reranker-offline`
@@ -206,6 +230,14 @@ The combined service accepts the same custom JSONL path argument and writes one 
 - `<stem>-filters.jsonl`
 
 After a successful merge, the three intermediate output files are removed.
+
+It also supports the `clarin-ms-marco` alias:
+
+```bash
+docker compose run --rm qa-all-filters-offline --datasets clarin-ms-marco
+```
+
+This first ensures `out_pl/clarin-ms-marco/translated.jsonl` exists, then runs all three filters on that materialized JSONL and writes the merged file next to it.
 
 Smoke test with the included sample file:
 
