@@ -12,6 +12,7 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 from translation_core import RateLimitReached, append_jsonl, load_done_ids_from_jsonl
@@ -84,6 +85,10 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
     "nq_qa": DatasetSpec(question_field="question", answer_field="answer"),
     "hotpotqa": DatasetSpec(question_field="anchor", answer_field="positive"),
 }
+
+CUSTOM_JSONL_DATASET_KEY = "custom_jsonl"
+CUSTOM_JSONL_QUESTION_FIELDS = ("anchor", "anchors", "query", "queries")
+CUSTOM_JSONL_ANSWER_FIELDS = ("positive", "positives", "answer", "answers", "response", "responses")
 
 
 def runtime_dependencies() -> dict[str, Any]:
@@ -359,17 +364,23 @@ BAD_ANSWER_FILTER_STAGES: tuple[BadAnswerFilterStage, ...] = (
 )
 
 
-def build_bad_answer_filter_schema() -> dict[str, Any]:
+def selected_bad_answer_filter_stages(args: argparse.Namespace | None = None) -> tuple[BadAnswerFilterStage, ...]:
+    if args is not None and not getattr(args, "enable_entity_integrity", False):
+        return tuple(stage for stage in BAD_ANSWER_FILTER_STAGES if stage.output_key != "answer_entity_integrity")
+    return BAD_ANSWER_FILTER_STAGES
+
+
+def build_bad_answer_filter_schema(
+    stages: tuple[BadAnswerFilterStage, ...] | None = None,
+) -> dict[str, Any]:
+    selected_stages = stages if stages is not None else BAD_ANSWER_FILTER_STAGES
     return {
         "type": "object",
         "properties": {
-            "question_language_naturalness": build_bad_answer_filter_naturalness_schema(),
-            "answer_language_naturalness": build_bad_answer_filter_naturalness_schema(),
-            "answer_entity_integrity": build_bad_answer_filter_entity_integrity_schema(),
-            "answer_semantic_coherence": build_bad_answer_filter_semantic_coherence_schema(),
-            "question_answer_meaning_drift": build_bad_answer_filter_meaning_drift_schema(),
+            stage.output_key: stage.build_schema()
+            for stage in selected_stages
         },
-        "required": [stage.output_key for stage in BAD_ANSWER_FILTER_STAGES],
+        "required": [stage.output_key for stage in selected_stages],
         "additionalProperties": False,
     }
 
@@ -453,8 +464,95 @@ def extract_question_answer(row: dict[str, Any], dataset_key: str) -> tuple[str,
     return question, answer
 
 
+def normalize_text_list(value: Any, field_name: str) -> list[str]:
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, list):
+        items = value
+    else:
+        raise RuntimeError(f"Field '{field_name}' must be a string or list of strings")
+
+    normalized: list[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            raise RuntimeError(f"Field '{field_name}' must contain only strings")
+        text = item.strip()
+        if text:
+            normalized.append(text)
+    return normalized
+
+
+def extract_first_matching_text_list(
+    row: dict[str, Any],
+    field_names: tuple[str, ...],
+    kind_label: str,
+) -> tuple[str, list[str]]:
+    for field_name in field_names:
+        if field_name not in row:
+            continue
+        values = normalize_text_list(row.get(field_name), field_name)
+        if values:
+            return field_name, values
+    available = ", ".join(field_names)
+    raise RuntimeError(f"Row is missing non-empty {kind_label} field. Expected one of: {available}")
+
+
+def extract_custom_jsonl_questions_answers(row: dict[str, Any]) -> tuple[list[str], list[str]]:
+    _, questions = extract_first_matching_text_list(row, CUSTOM_JSONL_QUESTION_FIELDS, "question")
+    _, answers = extract_first_matching_text_list(row, CUSTOM_JSONL_ANSWER_FIELDS, "answer")
+    return questions, answers
+
+
+def build_custom_jsonl_pairs(row: dict[str, Any]) -> list[dict[str, Any]]:
+    questions, answers = extract_custom_jsonl_questions_answers(row)
+    pairs: list[dict[str, Any]] = []
+    pair_index = 0
+    for question in questions:
+        for answer in answers:
+            pairs.append(
+                {
+                    "pair_index": pair_index,
+                    "question": question,
+                    "answer": answer,
+                }
+            )
+            pair_index += 1
+    return pairs
+
+
 def bad_answer_filter_stage_jsonl_name(stage_key: str) -> str:
     return f"bad_answer_filter_evaluations.{stage_key}.jsonl"
+
+
+def custom_bad_answer_filter_stage_jsonl_name(input_jsonl_path: str, stage_key: str) -> str:
+    input_path = Path(input_jsonl_path)
+    return str(input_path.with_name(f"{input_path.stem}.bad_answer_filter_evaluations.{stage_key}.jsonl"))
+
+
+def custom_bad_answer_filter_output_jsonl_name(input_jsonl_path: str) -> str:
+    input_path = Path(input_jsonl_path)
+    return str(input_path.with_name(f"{input_path.stem}.bad_answer_filter_evaluations.jsonl"))
+
+
+def custom_bad_answer_filter_failed_jsonl_name(input_jsonl_path: str) -> str:
+    input_path = Path(input_jsonl_path)
+    return str(input_path.with_name(f"{input_path.stem}.bad_answer_filter_evaluations_failed_rows.jsonl"))
+
+
+def resolve_input_output_paths(args: argparse.Namespace) -> tuple[str, str, str]:
+    if getattr(args, "input_jsonl_path", None):
+        input_jsonl = args.input_jsonl_path
+        out_jsonl = args.out_jsonl_name or custom_bad_answer_filter_output_jsonl_name(input_jsonl)
+        failed_jsonl = args.failed_jsonl_name or custom_bad_answer_filter_failed_jsonl_name(input_jsonl)
+        return input_jsonl, out_jsonl, failed_jsonl
+
+    dataset_dir = os.path.join(args.out_dir, args.dataset_key)
+    os.makedirs(dataset_dir, exist_ok=True)
+    return (
+        os.path.join(dataset_dir, args.input_jsonl_name),
+        os.path.join(dataset_dir, args.out_jsonl_name),
+        os.path.join(dataset_dir, args.failed_jsonl_name),
+    )
 
 
 def validate_score_result(result_obj: dict[str, Any], list_field: str | None = None) -> dict[str, Any]:
@@ -617,17 +715,109 @@ async def score_bad_answer_filter_stage_row(
     )
 
 
+async def score_custom_bad_answer_filter_stage_row(
+    row: dict[str, Any],
+    row_idx: int,
+    args: argparse.Namespace,
+    client: Any,
+    stage: BadAnswerFilterStage,
+) -> RowResult:
+    deps = runtime_dependencies()
+    rid = resolve_row_id(row, CUSTOM_JSONL_DATASET_KEY, row_idx)
+    pair_outputs: list[dict[str, Any]] = []
+    for pair in build_custom_jsonl_pairs(row):
+        result_obj = await deps["llm_call_json_async"](
+            client=client,
+            model=args.model,
+            system_prompt=BAD_ANSWER_FILTER_SYSTEM_PROMPT,
+            user_prompt=stage.build_prompt(pair["question"], pair["answer"]),
+            temperature=args.temperature,
+            max_retries=args.max_retries,
+            delay_seconds=args.delay_seconds,
+            response_schema=stage.build_schema(),
+        )
+
+        if stage.output_key in ("question_language_naturalness", "answer_language_naturalness"):
+            validated_obj = validate_score_result(result_obj)
+        elif stage.output_key == "answer_entity_integrity":
+            validated_obj = validate_score_result(result_obj, "suspicious_items")
+        elif stage.output_key == "answer_semantic_coherence":
+            validated_obj = validate_score_result(result_obj, "problem_fragments")
+        elif stage.output_key == "question_answer_meaning_drift":
+            validated_obj = validate_score_result(result_obj, "shared_meaning_elements")
+        else:
+            raise RuntimeError(f"Unsupported bad-answer-filter stage: {stage.output_key}")
+
+        pair_outputs.append(
+            {
+                "pair_index": pair["pair_index"],
+                "question": pair["question"],
+                "answer": pair["answer"],
+                stage.output_key: validated_obj,
+            }
+        )
+
+    return RowResult(
+        rid=rid,
+        out_row={
+            "id": rid,
+            "source_dataset": CUSTOM_JSONL_DATASET_KEY,
+            "row_idx": row_idx,
+            stage.output_key: pair_outputs,
+        },
+    )
+
+
 def merge_bad_answer_filter_results(
     row: dict[str, Any],
     stage_outputs: dict[str, dict[str, Any]],
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     aggregate: dict[str, Any] = {}
-    for stage in BAD_ANSWER_FILTER_STAGES:
+    for stage in selected_bad_answer_filter_stages(args):
         if stage.output_key not in stage_outputs:
             raise RuntimeError(f"Missing stage output for {stage.output_key}")
         aggregate[stage.output_key] = stage_outputs[stage.output_key]
     return build_output_row(row=row, label="", result_obj=aggregate, args=args)
+
+
+def merge_custom_bad_answer_filter_results(
+    row: dict[str, Any],
+    stage_outputs: dict[str, list[dict[str, Any]]],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    pairs_by_index: dict[int, dict[str, Any]] = {}
+    for stage in selected_bad_answer_filter_stages(args):
+        pair_outputs = stage_outputs.get(stage.output_key)
+        if pair_outputs is None:
+            raise RuntimeError(f"Missing stage output for {stage.output_key}")
+        for pair_output in pair_outputs:
+            pair_index = int(pair_output["pair_index"])
+            pair_entry = pairs_by_index.setdefault(
+                pair_index,
+                {
+                    "pair_index": pair_index,
+                    "question": pair_output["question"],
+                    "answer": pair_output["answer"],
+                    "bad_answer_filter": {},
+                },
+            )
+            pair_entry["bad_answer_filter"][stage.output_key] = pair_output[stage.output_key]
+
+    ordered_pairs = [pairs_by_index[idx] for idx in sorted(pairs_by_index)]
+    for pair in ordered_pairs:
+        for stage in selected_bad_answer_filter_stages(args):
+            if stage.output_key not in pair["bad_answer_filter"]:
+                raise RuntimeError(f"Missing stage output for pair_index={pair['pair_index']} stage={stage.output_key}")
+
+    out_row = dict(row)
+    out_row["bad_answer_filter_pairs"] = ordered_pairs
+    out_row["bad_answer_filter_model"] = args.model
+    out_row["bad_answer_filter_source"] = args.inference_source
+    out_row["bad_answer_filter_key_last6"] = args._api_key_last6
+    out_row["bad_answer_filter_base_url"] = args.base_url or None
+    out_row["bad_answer_filter_timestamp_unix"] = int(time.time())
+    return out_row
 
 
 async def run_bad_answer_filter_stage_async(
@@ -640,8 +830,14 @@ async def run_bad_answer_filter_stage_async(
     from tqdm import tqdm
 
     deps = runtime_dependencies()
-    stage_jsonl = os.path.join(dataset_dir, bad_answer_filter_stage_jsonl_name(stage.key))
-    failed_jsonl = os.path.join(dataset_dir, f"bad_answer_filter_evaluations.{stage.key}.failed_rows.jsonl")
+    if getattr(args, "input_jsonl_path", None):
+        stage_jsonl = custom_bad_answer_filter_stage_jsonl_name(args.input_jsonl_path, stage.key)
+        failed_jsonl = str(Path(stage_jsonl).with_name(f"{Path(stage_jsonl).stem}.failed_rows.jsonl"))
+        os.makedirs(str(Path(stage_jsonl).parent), exist_ok=True)
+        os.makedirs(str(Path(failed_jsonl).parent), exist_ok=True)
+    else:
+        stage_jsonl = os.path.join(dataset_dir, bad_answer_filter_stage_jsonl_name(stage.key))
+        failed_jsonl = os.path.join(dataset_dir, f"bad_answer_filter_evaluations.{stage.key}.failed_rows.jsonl")
     done_ids = load_done_ids_from_jsonl(stage_jsonl)
     pending = [
         (row_idx, row)
@@ -679,6 +875,8 @@ async def run_bad_answer_filter_stage_async(
 
     async def process_with_limit(row_idx: int, row: dict[str, Any]) -> RowResult:
         async with sem:
+            if getattr(args, "input_jsonl_path", None):
+                return await score_custom_bad_answer_filter_stage_row(row, row_idx, args, client, stage)
             return await score_bad_answer_filter_stage_row(row, row_idx, args.dataset_key, args, client, stage)
 
     tasks = [asyncio.create_task(process_with_limit(row_idx, row)) for row_idx, row in pending]
@@ -762,10 +960,11 @@ async def run_bad_answer_filter_stage_async(
 
 
 async def run_bad_answer_filter_dataset_async(args: argparse.Namespace) -> int:
-    dataset_dir = os.path.join(args.out_dir, args.dataset_key)
-    input_jsonl = os.path.join(dataset_dir, args.input_jsonl_name)
-    out_jsonl = os.path.join(dataset_dir, args.out_jsonl_name)
+    selected_stages = selected_bad_answer_filter_stages(args)
+    input_jsonl, out_jsonl, _ = resolve_input_output_paths(args)
+    dataset_dir = str(Path(input_jsonl).parent) if getattr(args, "input_jsonl_path", None) else os.path.join(args.out_dir, args.dataset_key)
     os.makedirs(dataset_dir, exist_ok=True)
+    os.makedirs(str(Path(out_jsonl).parent), exist_ok=True)
 
     rows = read_jsonl_rows(input_jsonl)
     total = len(rows)
@@ -789,12 +988,15 @@ async def run_bad_answer_filter_dataset_async(args: argparse.Namespace) -> int:
         return 0
 
     async with build_inference_client(args) as client:
-        for stage in BAD_ANSWER_FILTER_STAGES:
+        for stage in selected_stages:
             await run_bad_answer_filter_stage_async(args, client, stage, candidates, dataset_dir)
 
     stage_results: dict[str, dict[str, dict[str, Any]]] = {}
-    for stage in BAD_ANSWER_FILTER_STAGES:
-        stage_path = os.path.join(dataset_dir, bad_answer_filter_stage_jsonl_name(stage.key))
+    for stage in selected_stages:
+        if getattr(args, "input_jsonl_path", None):
+            stage_path = custom_bad_answer_filter_stage_jsonl_name(args.input_jsonl_path, stage.key)
+        else:
+            stage_path = os.path.join(dataset_dir, bad_answer_filter_stage_jsonl_name(stage.key))
         stage_rows = read_jsonl_by_id(stage_path)
         stage_results[stage.output_key] = {
             rid: row[stage.output_key]
@@ -809,7 +1011,7 @@ async def run_bad_answer_filter_dataset_async(args: argparse.Namespace) -> int:
             continue
         merged_stage_outputs: dict[str, dict[str, Any]] = {}
         missing_stage = None
-        for stage in BAD_ANSWER_FILTER_STAGES:
+        for stage in selected_stages:
             stage_output = stage_results.get(stage.output_key, {}).get(rid)
             if stage_output is None:
                 missing_stage = stage.output_key
@@ -818,7 +1020,11 @@ async def run_bad_answer_filter_dataset_async(args: argparse.Namespace) -> int:
         if missing_stage is not None:
             logging.warning("Skipping final merge for id=%s because stage %s is missing.", rid, missing_stage)
             continue
-        append_jsonl(out_jsonl, merge_bad_answer_filter_results(row=row, stage_outputs=merged_stage_outputs, args=args))
+        if getattr(args, "input_jsonl_path", None):
+            out_row = merge_custom_bad_answer_filter_results(row=row, stage_outputs=merged_stage_outputs, args=args)
+        else:
+            out_row = merge_bad_answer_filter_results(row=row, stage_outputs=merged_stage_outputs, args=args)
+        append_jsonl(out_jsonl, out_row)
         final_done_ids.add(rid)
 
     logging.info("Bad-answer evaluation merge finished. Output: %s", out_jsonl)
@@ -900,6 +1106,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-retries", type=int, default=1)
     p.add_argument("--fail-fast", action="store_true", help="Stop whole run on first row-level scoring error.")
     p.add_argument(
+        "--input-jsonl-path",
+        default=None,
+        help="Path to a custom JSONL file for --task bad_answer_filter. Mutually exclusive with --datasets.",
+    )
+    p.add_argument(
         "--datasets",
         nargs="+",
         default=["all"],
@@ -911,6 +1122,11 @@ def parse_args() -> argparse.Namespace:
         default="answer_relevance",
         choices=["answer_relevance", "bad_answer_filter"],
         help="Scoring task: answer relevance classifier or multi-stage bad-answer evaluation.",
+    )
+    p.add_argument(
+        "--enable-entity-integrity",
+        action="store_true",
+        help="For --task bad_answer_filter, include the optional answer_entity_integrity prompt.",
     )
     p.add_argument("--out-dir", default="out_pl")
     p.add_argument("--input-jsonl-name", default="translated.jsonl")
@@ -937,10 +1153,8 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
         return await run_bad_answer_filter_dataset_async(args)
 
     deps = runtime_dependencies()
+    input_jsonl, out_jsonl, failed_jsonl = resolve_input_output_paths(args)
     dataset_dir = os.path.join(args.out_dir, args.dataset_key)
-    input_jsonl = os.path.join(dataset_dir, args.input_jsonl_name)
-    out_jsonl = os.path.join(dataset_dir, args.out_jsonl_name)
-    failed_jsonl = os.path.join(dataset_dir, args.failed_jsonl_name)
     os.makedirs(dataset_dir, exist_ok=True)
 
     rows = read_jsonl_rows(input_jsonl)
@@ -1095,10 +1309,20 @@ async def run_async(args: argparse.Namespace) -> int:
     deps = runtime_dependencies()
     args.base_url, args.api_key = deps["resolve_api_connection"](args)
     args._api_key_last6 = "OFFLINE" if args.inference_source == "offline" else (args.api_key[-6:] if args.api_key else "EMPTY")
-    if args.out_jsonl_name is None:
+    if args.input_jsonl_path and args.datasets != ["all"]:
+        raise RuntimeError("--input-jsonl-path cannot be used together with --datasets")
+    if args.input_jsonl_path and args.task != "bad_answer_filter":
+        raise RuntimeError("--input-jsonl-path is currently supported only for --task bad_answer_filter")
+    if args.out_jsonl_name is None and not args.input_jsonl_path:
         args.out_jsonl_name = task_output_jsonl_name(args.task)
-    if args.failed_jsonl_name is None:
+    if args.failed_jsonl_name is None and not args.input_jsonl_path:
         args.failed_jsonl_name = task_failed_jsonl_name(args.task)
+
+    if args.input_jsonl_path:
+        run_args = copy.deepcopy(args)
+        run_args.dataset_key = CUSTOM_JSONL_DATASET_KEY
+        rc = await run_single_dataset_async(run_args)
+        return rc
 
     for dataset_key in selected_dataset_keys(args.datasets):
         run_args = copy.deepcopy(args)

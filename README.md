@@ -125,10 +125,31 @@ docker compose run --rm qa-bad-answer-filter-offline --datasets nq_qa hotpotqa
 ```
 
 This reads `out_pl/<dataset>/translated.jsonl` and writes `out_pl/<dataset>/bad_answer_filter_evaluations.jsonl`.
-The output row keeps the original translated record and adds a `bad_answer_filter` object with five structured evaluations:
-`question_language_naturalness`, `answer_language_naturalness`, `answer_entity_integrity`,
-`answer_semantic_coherence`, and `question_answer_meaning_drift`.
+By default, the output row keeps the original translated record and adds a `bad_answer_filter` object with four structured evaluations:
+`question_language_naturalness`, `answer_language_naturalness`, `answer_semantic_coherence`, and `question_answer_meaning_drift`.
+To additionally enable the optional `answer_entity_integrity` prompt, run:
+
+```bash
+docker compose run --rm qa-bad-answer-filter-offline --datasets nq_qa hotpotqa --enable-entity-integrity
+```
+
 Completed rows are skipped on resume here as well.
+
+You can also run the same bad-answer filter on any custom JSONL file:
+
+```bash
+docker compose run --rm qa-bad-answer-filter-offline --task bad_answer_filter --input-jsonl-path /app/data/custom.jsonl
+```
+
+In custom JSONL mode, the runner looks for the first non-empty question field from:
+`anchor`, `anchors`, `query`, `queries`
+and the first non-empty answer field from:
+`positive`, `positives`, `answer`, `answers`, `response`, `responses`.
+Each field may be either a string or a list of strings.
+If a row contains multiple questions and multiple answers, the filter evaluates the full Cartesian product of question-answer pairs.
+The output is written next to the input file as `<stem>.bad_answer_filter_evaluations.jsonl`, and each output row contains `bad_answer_filter_pairs` with:
+`pair_index`, `question`, `answer`, and `bad_answer_filter` for that pair.
+The optional `--enable-entity-integrity` flag works in custom JSONL mode as well.
 
 Reranker scoring on the same translated Polish files:
 
