@@ -1,17 +1,27 @@
 import argparse
+import sys
 
 import pytest
 
 from run_answer_relevance_vllm import (
     ANSWER_RELEVANCE_LABELS,
     BAD_ANSWER_FILTER_STAGES,
+    CUSTOM_JSONL_DATASET_KEY,
     build_answer_relevance_schema,
+    build_custom_jsonl_pairs,
     build_bad_answer_filter_entity_integrity_prompt,
     build_bad_answer_filter_schema,
     build_bad_answer_filter_meaning_drift_prompt,
     build_bad_answer_filter_naturalness_prompt,
     build_output_row,
+    custom_bad_answer_filter_failed_jsonl_name,
+    custom_bad_answer_filter_output_jsonl_name,
+    extract_custom_jsonl_questions_answers,
     extract_question_answer,
+    merge_custom_bad_answer_filter_results,
+    parse_args,
+    resolve_input_output_paths,
+    selected_bad_answer_filter_stages,
     selected_dataset_keys,
     task_failed_jsonl_name,
     task_output_jsonl_name,
@@ -45,6 +55,55 @@ def test_extract_question_answer_requires_non_empty_text() -> None:
         extract_question_answer({"question": "", "answer": "x"}, "nq_qa")
 
 
+def test_extract_custom_jsonl_questions_answers_supports_strings() -> None:
+    row = {"anchor": "Jak masz na imie?", "positive": "Jan"}
+    questions, answers = extract_custom_jsonl_questions_answers(row)
+    assert questions == ["Jak masz na imie?"]
+    assert answers == ["Jan"]
+
+
+def test_extract_custom_jsonl_questions_answers_supports_lists_and_priority() -> None:
+    row = {
+        "queries": ["Drugie pytanie"],
+        "query": "Pierwsze pytanie",
+        "responses": ["Odpowiedz A", "Odpowiedz B"],
+    }
+    questions, answers = extract_custom_jsonl_questions_answers(row)
+    assert questions == ["Pierwsze pytanie"]
+    assert answers == ["Odpowiedz A", "Odpowiedz B"]
+
+
+def test_extract_custom_jsonl_questions_answers_filters_empty_strings() -> None:
+    row = {
+        "anchors": ["", "  ", "Pytanie"],
+        "answers": [" ", "Odpowiedz"],
+    }
+    questions, answers = extract_custom_jsonl_questions_answers(row)
+    assert questions == ["Pytanie"]
+    assert answers == ["Odpowiedz"]
+
+
+def test_extract_custom_jsonl_questions_answers_requires_supported_question_field() -> None:
+    with pytest.raises(RuntimeError, match="missing non-empty question field"):
+        extract_custom_jsonl_questions_answers({"answer": "x"})
+
+
+def test_extract_custom_jsonl_questions_answers_requires_supported_answer_field() -> None:
+    with pytest.raises(RuntimeError, match="missing non-empty answer field"):
+        extract_custom_jsonl_questions_answers({"anchor": "x"})
+
+
+def test_build_custom_jsonl_pairs_uses_cartesian_product() -> None:
+    row = {
+        "queries": ["P1", "P2"],
+        "responses": ["O1", "O2", "O3"],
+    }
+    pairs = build_custom_jsonl_pairs(row)
+    assert len(pairs) == 6
+    assert pairs[0] == {"pair_index": 0, "question": "P1", "answer": "O1"}
+    assert pairs[-1] == {"pair_index": 5, "question": "P2", "answer": "O3"}
+
+
 def test_build_answer_relevance_schema_keeps_explanation_before_label() -> None:
     schema = build_answer_relevance_schema()
     assert list(schema["properties"].keys()) == ["explanation", "label"]
@@ -55,6 +114,26 @@ def test_build_bad_answer_filter_schema_contains_all_stage_outputs() -> None:
     schema = build_bad_answer_filter_schema()
     assert list(schema["properties"].keys()) == [stage.output_key for stage in BAD_ANSWER_FILTER_STAGES]
     assert schema["required"] == [stage.output_key for stage in BAD_ANSWER_FILTER_STAGES]
+
+
+def test_selected_bad_answer_filter_stages_skips_entity_integrity_by_default() -> None:
+    args = argparse.Namespace(enable_entity_integrity=False)
+    output_keys = [stage.output_key for stage in selected_bad_answer_filter_stages(args)]
+    assert "answer_entity_integrity" not in output_keys
+
+
+def test_selected_bad_answer_filter_stages_can_enable_entity_integrity() -> None:
+    args = argparse.Namespace(enable_entity_integrity=True)
+    output_keys = [stage.output_key for stage in selected_bad_answer_filter_stages(args)]
+    assert "answer_entity_integrity" in output_keys
+
+
+def test_build_bad_answer_filter_schema_can_use_selected_stage_subset() -> None:
+    args = argparse.Namespace(enable_entity_integrity=False)
+    stages = selected_bad_answer_filter_stages(args)
+    schema = build_bad_answer_filter_schema(stages)
+    assert list(schema["properties"].keys()) == [stage.output_key for stage in stages]
+    assert "answer_entity_integrity" not in schema["properties"]
 
 
 def test_build_bad_answer_filter_prompts_embed_texts() -> None:
@@ -106,6 +185,7 @@ def test_build_output_row_supports_bad_answer_filter_task() -> None:
         inference_source="offline",
         base_url=None,
         _api_key_last6="OFFLINE",
+        enable_entity_integrity=False,
     )
     row = {
         "id": "hotpotqa_1",
@@ -125,13 +205,102 @@ def test_build_output_row_supports_bad_answer_filter_task() -> None:
         result_obj=result_obj,
         args=args,
     )
-    assert list(out_row["bad_answer_filter"].keys()) == [stage.output_key for stage in BAD_ANSWER_FILTER_STAGES]
-    assert out_row["bad_answer_filter"]["answer_entity_integrity"]["score"] == 6
+    assert list(out_row["bad_answer_filter"].keys()) == [stage.output_key for stage in selected_bad_answer_filter_stages(args)]
+    assert "answer_entity_integrity" not in out_row["bad_answer_filter"]
     assert out_row["bad_answer_filter_model"] == "model-x"
     assert out_row["bad_answer_filter_source"] == "offline"
     assert out_row["bad_answer_filter_key_last6"] == "OFFLINE"
     assert out_row["bad_answer_filter_base_url"] is None
     assert isinstance(out_row["bad_answer_filter_timestamp_unix"], int)
+
+
+def test_build_output_row_supports_bad_answer_filter_with_entity_integrity_enabled() -> None:
+    args = argparse.Namespace(
+        task="bad_answer_filter",
+        model="model-x",
+        inference_source="offline",
+        base_url=None,
+        _api_key_last6="OFFLINE",
+        enable_entity_integrity=True,
+    )
+    row = {
+        "id": "hotpotqa_1",
+        "anchor": "Ktory zawodnik gral dla East Bengal?",
+        "positive": "East Bengal",
+    }
+    result_obj = {
+        "question_language_naturalness": {"reason": "OK", "score": 5},
+        "answer_language_naturalness": {"reason": "OK", "score": 4},
+        "answer_entity_integrity": {"reason": "OK", "suspicious_items": [], "score": 6},
+        "answer_semantic_coherence": {"reason": "OK", "problem_fragments": [], "score": 4},
+        "question_answer_meaning_drift": {"reason": "OK", "shared_meaning_elements": ["East Bengal"], "score": 5},
+    }
+    out_row = build_output_row(
+        row=row,
+        label="",
+        result_obj=result_obj,
+        args=args,
+    )
+    assert list(out_row["bad_answer_filter"].keys()) == [stage.output_key for stage in selected_bad_answer_filter_stages(args)]
+    assert out_row["bad_answer_filter"]["answer_entity_integrity"]["score"] == 6
+
+
+def test_merge_custom_bad_answer_filter_results_builds_pair_list() -> None:
+    args = argparse.Namespace(
+        task="bad_answer_filter",
+        model="model-x",
+        inference_source="offline",
+        base_url=None,
+        _api_key_last6="OFFLINE",
+        enable_entity_integrity=False,
+    )
+    row = {"anchor": ["P1", "P2"], "response": ["O1"]}
+    stage_outputs = {
+        "question_language_naturalness": [
+            {"pair_index": 0, "question": "P1", "answer": "O1", "question_language_naturalness": {"reason": "OK", "score": 5}},
+            {"pair_index": 1, "question": "P2", "answer": "O1", "question_language_naturalness": {"reason": "OK", "score": 4}},
+        ],
+        "answer_language_naturalness": [
+            {"pair_index": 0, "question": "P1", "answer": "O1", "answer_language_naturalness": {"reason": "OK", "score": 6}},
+            {"pair_index": 1, "question": "P2", "answer": "O1", "answer_language_naturalness": {"reason": "OK", "score": 6}},
+        ],
+        "answer_semantic_coherence": [
+            {"pair_index": 0, "question": "P1", "answer": "O1", "answer_semantic_coherence": {"reason": "OK", "problem_fragments": [], "score": 5}},
+            {"pair_index": 1, "question": "P2", "answer": "O1", "answer_semantic_coherence": {"reason": "OK", "problem_fragments": [], "score": 5}},
+        ],
+        "question_answer_meaning_drift": [
+            {"pair_index": 0, "question": "P1", "answer": "O1", "question_answer_meaning_drift": {"reason": "OK", "shared_meaning_elements": ["x"], "score": 4}},
+            {"pair_index": 1, "question": "P2", "answer": "O1", "question_answer_meaning_drift": {"reason": "OK", "shared_meaning_elements": ["y"], "score": 3}},
+        ],
+    }
+    out_row = merge_custom_bad_answer_filter_results(row, stage_outputs, args)
+    assert len(out_row["bad_answer_filter_pairs"]) == 2
+    assert out_row["bad_answer_filter_pairs"][0]["pair_index"] == 0
+    assert out_row["bad_answer_filter_pairs"][0]["question"] == "P1"
+    assert out_row["bad_answer_filter_pairs"][0]["answer"] == "O1"
+    assert "answer_entity_integrity" not in out_row["bad_answer_filter_pairs"][0]["bad_answer_filter"]
+    assert out_row["bad_answer_filter_model"] == "model-x"
+
+
+def test_custom_bad_answer_filter_output_paths_are_next_to_input_file() -> None:
+    input_path = r"c:\tmp\sample.jsonl"
+    assert custom_bad_answer_filter_output_jsonl_name(input_path) == r"c:\tmp\sample.bad_answer_filter_evaluations.jsonl"
+    assert custom_bad_answer_filter_failed_jsonl_name(input_path) == r"c:\tmp\sample.bad_answer_filter_evaluations_failed_rows.jsonl"
+
+
+def test_resolve_input_output_paths_uses_custom_jsonl_paths() -> None:
+    args = argparse.Namespace(
+        input_jsonl_path=r"c:\tmp\sample.jsonl",
+        out_jsonl_name=None,
+        failed_jsonl_name=None,
+        out_dir="out_pl",
+        dataset_key=CUSTOM_JSONL_DATASET_KEY,
+        input_jsonl_name="translated.jsonl",
+    )
+    input_jsonl, out_jsonl, failed_jsonl = resolve_input_output_paths(args)
+    assert input_jsonl == r"c:\tmp\sample.jsonl"
+    assert out_jsonl == r"c:\tmp\sample.bad_answer_filter_evaluations.jsonl"
+    assert failed_jsonl == r"c:\tmp\sample.bad_answer_filter_evaluations_failed_rows.jsonl"
 
 
 def test_selected_dataset_keys_expands_all_without_duplicates() -> None:
@@ -143,3 +312,10 @@ def test_task_specific_output_names() -> None:
     assert task_output_jsonl_name("bad_answer_filter") == "bad_answer_filter_evaluations.jsonl"
     assert task_failed_jsonl_name("answer_relevance") == "answer_relevance_failed_rows.jsonl"
     assert task_failed_jsonl_name("bad_answer_filter") == "bad_answer_filter_evaluations_failed_rows.jsonl"
+
+
+def test_parse_args_accepts_input_jsonl_path(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["prog", "--model", "model-x", "--task", "bad_answer_filter", "--input-jsonl-path", "custom.jsonl"])
+    args = parse_args()
+    assert args.task == "bad_answer_filter"
+    assert args.input_jsonl_path == "custom.jsonl"

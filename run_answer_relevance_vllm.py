@@ -586,7 +586,7 @@ def build_output_row(
         prefix = "bad_answer_filter"
         out_row[prefix] = {
             stage.output_key: result_obj[stage.output_key]
-            for stage in BAD_ANSWER_FILTER_STAGES
+            for stage in selected_bad_answer_filter_stages(args)
         }
     else:
         prefix = "answer_relevance"

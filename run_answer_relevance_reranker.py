@@ -10,11 +10,14 @@ import os
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterator
 
 from tqdm import tqdm
 
 from run_answer_relevance_vllm import (
+    CUSTOM_JSONL_DATASET_KEY,
+    build_custom_jsonl_pairs,
     extract_question_answer,
     read_jsonl_rows,
     resolve_row_id,
@@ -63,8 +66,7 @@ class CandidateRow:
     row_idx: int
     row: dict[str, Any]
     rid: str
-    query: str
-    passage: str
+    pairs: list[tuple[str, str]]
     estimated_tokens: int
 
 
@@ -263,6 +265,21 @@ def build_output_row(
     return out_row
 
 
+def build_custom_output_row(
+    row: dict[str, Any],
+    *,
+    pairs: list[dict[str, Any]],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    out_row = dict(row)
+    out_row["answer_relevance_reranker_pairs"] = pairs
+    out_row["answer_relevance_reranker_model"] = args.reranker_model
+    out_row["answer_relevance_reranker_dtype"] = args.reranker_dtype
+    out_row["answer_relevance_reranker_batch_size"] = int(args.batch_size)
+    out_row["answer_relevance_reranker_timestamp_unix"] = int(time.time())
+    return out_row
+
+
 def estimate_pair_tokens_heuristic(query: str, passage: str, max_length: int) -> int:
     # Prosta heurystyka do sortowania i batchowania po podobnej długości.
     # Nie musi być idealna — ma tylko ograniczyć padding.
@@ -288,6 +305,32 @@ def flush_jsonl_buffer(path: str, buffer_rows: list[dict[str, Any]]) -> None:
     buffer_rows.clear()
 
 
+def custom_output_jsonl_name(input_jsonl_path: str) -> str:
+    input_path = Path(input_jsonl_path)
+    return str(input_path.with_name(f"{input_path.stem}.answer_relevance_reranker.jsonl"))
+
+
+def custom_failed_jsonl_name(input_jsonl_path: str) -> str:
+    input_path = Path(input_jsonl_path)
+    return str(input_path.with_name(f"{input_path.stem}.answer_relevance_reranker_failed_rows.jsonl"))
+
+
+def resolve_input_output_paths(args: argparse.Namespace) -> tuple[str, str, str]:
+    if getattr(args, "input_jsonl_path", None):
+        input_jsonl = args.input_jsonl_path
+        out_jsonl = args.out_jsonl_name or custom_output_jsonl_name(input_jsonl)
+        failed_jsonl = args.failed_jsonl_name or custom_failed_jsonl_name(input_jsonl)
+        return input_jsonl, out_jsonl, failed_jsonl
+
+    dataset_dir = os.path.join(args.out_dir, args.dataset_key)
+    os.makedirs(dataset_dir, exist_ok=True)
+    return (
+        os.path.join(dataset_dir, args.input_jsonl_name),
+        os.path.join(dataset_dir, args.out_jsonl_name),
+        os.path.join(dataset_dir, args.failed_jsonl_name),
+    )
+
+
 def build_candidates(
     rows: list[dict[str, Any]],
     *,
@@ -310,15 +353,19 @@ def build_candidates(
             skipped_failed += 1
             continue
 
-        query, passage = extract_question_answer(row, dataset_key)
-        estimated_tokens = estimate_pair_tokens_heuristic(query, passage, max_length)
+        if dataset_key == CUSTOM_JSONL_DATASET_KEY:
+            pair_dicts = build_custom_jsonl_pairs(row)
+            pairs = [(pair["question"], pair["answer"]) for pair in pair_dicts]
+        else:
+            query, passage = extract_question_answer(row, dataset_key)
+            pairs = [(query, passage)]
+        estimated_tokens = sum(estimate_pair_tokens_heuristic(query, passage, max_length) for query, passage in pairs)
         candidates.append(
             CandidateRow(
                 row_idx=row_idx,
                 row=row,
                 rid=rid,
-                query=query,
-                passage=passage,
+                pairs=pairs,
                 estimated_tokens=estimated_tokens,
             )
         )
@@ -528,6 +575,11 @@ def parse_args() -> argparse.Namespace:
         )
     )
     p.add_argument(
+        "--input-jsonl-path",
+        default=None,
+        help="Path to a custom JSONL file. Mutually exclusive with --datasets.",
+    )
+    p.add_argument(
         "--datasets",
         nargs="+",
         default=["all"],
@@ -536,8 +588,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--out-dir", default="out_pl")
     p.add_argument("--input-jsonl-name", default="translated.jsonl")
-    p.add_argument("--out-jsonl-name", default="answer_relevance_reranker.jsonl")
-    p.add_argument("--failed-jsonl-name", default="answer_relevance_reranker_failed_rows.jsonl")
+    p.add_argument("--out-jsonl-name", default=None)
+    p.add_argument("--failed-jsonl-name", default=None)
     p.add_argument(
         "--retry-failed-rows",
         action="store_true",
@@ -625,23 +677,44 @@ def score_rows_or_fallback(
     dataset_key: str,
     args: argparse.Namespace,
 ) -> tuple[list[ScoredRow], list[dict[str, Any]]]:
-    pairs = [(item.query, item.passage) for item in batch]
+    pairs = [pair for item in batch for pair in item.pairs]
 
     try:
         scores = reranker.score_pairs(pairs)
         results: list[ScoredRow] = []
-        for item, (raw_score, sigmoid_score) in zip(batch, scores):
-            results.append(
-                ScoredRow(
-                    rid=item.rid,
-                    out_row=build_output_row(
-                        item.row,
-                        raw_score=raw_score,
-                        sigmoid_score=sigmoid_score,
-                        args=args,
-                    ),
+        score_offset = 0
+        for item in batch:
+            item_scores = scores[score_offset : score_offset + len(item.pairs)]
+            score_offset += len(item.pairs)
+            if dataset_key == CUSTOM_JSONL_DATASET_KEY:
+                pair_outputs = []
+                for pair_index, ((query, passage), (raw_score, sigmoid_score)) in enumerate(zip(item.pairs, item_scores)):
+                    pair_outputs.append(
+                        {
+                            "pair_index": pair_index,
+                            "question": query,
+                            "answer": passage,
+                            "answer_relevance_reranker": {
+                                "raw_score": raw_score,
+                                "sigmoid_score": sigmoid_score,
+                                "prompt": args.reranker_prompt,
+                                "cutoff_layers": list(args.reranker_cutoff_layers),
+                                "compress_ratio": int(args.reranker_compress_ratio),
+                                "compress_layers": list(args.reranker_compress_layers),
+                                "max_length": int(args.reranker_max_length),
+                            },
+                        }
+                    )
+                out_row = build_custom_output_row(item.row, pairs=pair_outputs, args=args)
+            else:
+                raw_score, sigmoid_score = item_scores[0]
+                out_row = build_output_row(
+                    item.row,
+                    raw_score=raw_score,
+                    sigmoid_score=sigmoid_score,
+                    args=args,
                 )
-            )
+            results.append(ScoredRow(rid=item.rid, out_row=out_row))
         return results, []
     except Exception as exc:  # noqa: BLE001
         if len(batch) == 1:
@@ -675,11 +748,11 @@ def score_rows_or_fallback(
 
 
 def run_single_dataset(args: argparse.Namespace, reranker: GemmaLightweightReranker) -> int:
-    dataset_dir = os.path.join(args.out_dir, args.dataset_key)
-    input_jsonl = os.path.join(dataset_dir, args.input_jsonl_name)
-    out_jsonl = os.path.join(dataset_dir, args.out_jsonl_name)
-    failed_jsonl = os.path.join(dataset_dir, args.failed_jsonl_name)
+    input_jsonl, out_jsonl, failed_jsonl = resolve_input_output_paths(args)
+    dataset_dir = str(Path(input_jsonl).parent) if args.dataset_key == CUSTOM_JSONL_DATASET_KEY else os.path.join(args.out_dir, args.dataset_key)
     os.makedirs(dataset_dir, exist_ok=True)
+    os.makedirs(str(Path(out_jsonl).parent), exist_ok=True)
+    os.makedirs(str(Path(failed_jsonl).parent), exist_ok=True)
 
     rows = read_jsonl_rows(input_jsonl)
     total = len(rows)
@@ -794,7 +867,13 @@ def main() -> int:
         force=True,
     )
 
-    selected_keys = selected_dataset_keys(args.datasets)
+    if args.input_jsonl_path and args.datasets != ["all"]:
+        raise RuntimeError("--input-jsonl-path cannot be used together with --datasets")
+    if args.out_jsonl_name is None and not args.input_jsonl_path:
+        args.out_jsonl_name = "answer_relevance_reranker.jsonl"
+    if args.failed_jsonl_name is None and not args.input_jsonl_path:
+        args.failed_jsonl_name = "answer_relevance_reranker_failed_rows.jsonl"
+    selected_keys = [CUSTOM_JSONL_DATASET_KEY] if args.input_jsonl_path else selected_dataset_keys(args.datasets)
     logging.info("Selected dataset runs: %s", ", ".join(selected_keys))
 
     reranker = GemmaLightweightReranker(args)
@@ -804,8 +883,8 @@ def main() -> int:
         logging.info(
             "Starting reranker run: key=%s out_dir=%s input_jsonl=%s",
             dataset_key,
-            os.path.join(args.out_dir, dataset_key),
-            args.input_jsonl_name,
+            str(Path(args.input_jsonl_path).parent) if dataset_key == CUSTOM_JSONL_DATASET_KEY else os.path.join(args.out_dir, dataset_key),
+            args.input_jsonl_path or args.input_jsonl_name,
         )
         rc = run_single_dataset(run_args, reranker)
         if rc != 0:

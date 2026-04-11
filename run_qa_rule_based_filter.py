@@ -9,12 +9,15 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from tqdm import tqdm
 
 from qa_rule_based_filter import evaluate_row
 from run_answer_relevance_vllm import (
+    CUSTOM_JSONL_DATASET_KEY,
+    build_custom_jsonl_pairs,
     extract_question_answer,
     read_jsonl_rows,
     resolve_row_id,
@@ -51,6 +54,14 @@ def build_output_row(row: dict[str, Any], *, evaluation: dict[str, Any]) -> dict
     return out_row
 
 
+def build_custom_output_row(row: dict[str, Any], *, pair_evaluations: list[dict[str, Any]]) -> dict[str, Any]:
+    out_row = dict(row)
+    out_row[f"{FILTER_PREFIX}_pairs"] = pair_evaluations
+    out_row[f"{FILTER_PREFIX}_source"] = "rule_based"
+    out_row[f"{FILTER_PREFIX}_timestamp_unix"] = int(time.time())
+    return out_row
+
+
 def process_row(row: dict[str, Any], row_idx: int, dataset_key: str) -> RuleFilterResult:
     rid = resolve_row_id(row, dataset_key, row_idx)
     question, answer = extract_question_answer(row, dataset_key)
@@ -58,11 +69,62 @@ def process_row(row: dict[str, Any], row_idx: int, dataset_key: str) -> RuleFilt
     return RuleFilterResult(rid=rid, out_row=build_output_row(row, evaluation=evaluation))
 
 
+def process_custom_row(row: dict[str, Any], row_idx: int) -> RuleFilterResult:
+    rid = resolve_row_id(row, CUSTOM_JSONL_DATASET_KEY, row_idx)
+    pair_evaluations: list[dict[str, Any]] = []
+    for pair in build_custom_jsonl_pairs(row):
+        evaluation = evaluate_row(pair["question"], pair["answer"])
+        pair_evaluations.append(
+            {
+                "pair_index": pair["pair_index"],
+                "question": pair["question"],
+                "answer": pair["answer"],
+                FILTER_PREFIX: {
+                    "is_good": bool(evaluation["is_good"]),
+                    "reasons": list(evaluation["reasons"]),
+                    "reasons_str": str(evaluation["reasons_str"]),
+                },
+            }
+        )
+    return RuleFilterResult(rid=rid, out_row=build_custom_output_row(row, pair_evaluations=pair_evaluations))
+
+
+def custom_output_jsonl_name(input_jsonl_path: str) -> str:
+    input_path = Path(input_jsonl_path)
+    return str(input_path.with_name(f"{input_path.stem}.{task_output_jsonl_name()}"))
+
+
+def custom_failed_jsonl_name(input_jsonl_path: str) -> str:
+    input_path = Path(input_jsonl_path)
+    return str(input_path.with_name(f"{input_path.stem}.{task_failed_jsonl_name()}"))
+
+
+def resolve_input_output_paths(args: argparse.Namespace) -> tuple[str, str, str]:
+    if getattr(args, "input_jsonl_path", None):
+        input_jsonl = args.input_jsonl_path
+        out_jsonl = args.out_jsonl_name or custom_output_jsonl_name(input_jsonl)
+        failed_jsonl = args.failed_jsonl_name or custom_failed_jsonl_name(input_jsonl)
+        return input_jsonl, out_jsonl, failed_jsonl
+
+    dataset_dir = os.path.join(args.out_dir, args.dataset_key)
+    os.makedirs(dataset_dir, exist_ok=True)
+    return (
+        os.path.join(dataset_dir, args.input_jsonl_name),
+        os.path.join(dataset_dir, args.out_jsonl_name),
+        os.path.join(dataset_dir, args.failed_jsonl_name),
+    )
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
             "Filter translated QA pairs with deterministic rule-based heuristics and write resumable JSONL outputs."
         )
+    )
+    p.add_argument(
+        "--input-jsonl-path",
+        default=None,
+        help="Path to a custom JSONL file. Mutually exclusive with --datasets.",
     )
     p.add_argument(
         "--datasets",
@@ -73,8 +135,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--out-dir", default="out_pl")
     p.add_argument("--input-jsonl-name", default="translated.jsonl")
-    p.add_argument("--out-jsonl-name", default=task_output_jsonl_name())
-    p.add_argument("--failed-jsonl-name", default=task_failed_jsonl_name())
+    p.add_argument("--out-jsonl-name", default=None)
+    p.add_argument("--failed-jsonl-name", default=None)
     p.add_argument(
         "--retry-failed-rows",
         action="store_true",
@@ -95,11 +157,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_single_dataset(args: argparse.Namespace) -> int:
-    dataset_dir = os.path.join(args.out_dir, args.dataset_key)
-    input_jsonl = os.path.join(dataset_dir, args.input_jsonl_name)
-    out_jsonl = os.path.join(dataset_dir, args.out_jsonl_name)
-    failed_jsonl = os.path.join(dataset_dir, args.failed_jsonl_name)
+    input_jsonl, out_jsonl, failed_jsonl = resolve_input_output_paths(args)
+    dataset_dir = str(Path(input_jsonl).parent) if args.dataset_key == CUSTOM_JSONL_DATASET_KEY else os.path.join(args.out_dir, args.dataset_key)
     os.makedirs(dataset_dir, exist_ok=True)
+    os.makedirs(str(Path(out_jsonl).parent), exist_ok=True)
+    os.makedirs(str(Path(failed_jsonl).parent), exist_ok=True)
 
     rows = read_jsonl_rows(input_jsonl)
     total = len(rows)
@@ -169,7 +231,7 @@ def run_single_dataset(args: argparse.Namespace) -> int:
 
     with ThreadPoolExecutor(max_workers=max(1, int(args.max_workers))) as ex:
         future_map = {
-            ex.submit(process_row, row, row_idx, args.dataset_key): (row_idx, resolve_row_id(row, args.dataset_key, row_idx))
+            ex.submit(process_custom_row if args.dataset_key == CUSTOM_JSONL_DATASET_KEY else process_row, row, row_idx, *( () if args.dataset_key == CUSTOM_JSONL_DATASET_KEY else (args.dataset_key,) )): (row_idx, resolve_row_id(row, args.dataset_key, row_idx))
             for row_idx, row in candidates
         }
         for future in as_completed(future_map):
@@ -227,7 +289,13 @@ def main() -> int:
         force=True,
     )
 
-    selected_keys = selected_dataset_keys(args.datasets)
+    if args.input_jsonl_path and args.datasets != ["all"]:
+        raise RuntimeError("--input-jsonl-path cannot be used together with --datasets")
+    if args.out_jsonl_name is None and not args.input_jsonl_path:
+        args.out_jsonl_name = task_output_jsonl_name()
+    if args.failed_jsonl_name is None and not args.input_jsonl_path:
+        args.failed_jsonl_name = task_failed_jsonl_name()
+    selected_keys = [CUSTOM_JSONL_DATASET_KEY] if args.input_jsonl_path else selected_dataset_keys(args.datasets)
     logging.info("Selected dataset runs: %s", ", ".join(selected_keys))
 
     for dataset_key in selected_keys:
@@ -236,8 +304,8 @@ def main() -> int:
         logging.info(
             "Starting rule-based QA filter run: key=%s out_dir=%s input_jsonl=%s",
             dataset_key,
-            os.path.join(args.out_dir, dataset_key),
-            args.input_jsonl_name,
+            str(Path(args.input_jsonl_path).parent) if dataset_key == CUSTOM_JSONL_DATASET_KEY else os.path.join(args.out_dir, dataset_key),
+            args.input_jsonl_path or args.input_jsonl_name,
         )
         rc = run_single_dataset(run_args)
         if rc != 0:

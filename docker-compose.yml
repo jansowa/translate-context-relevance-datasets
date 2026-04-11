@@ -267,6 +267,31 @@ services:
     working_dir: /app
     entrypoint: ["python3", "run_qa_rule_based_filter.py"]
 
+  qa-all-filters-offline:
+    build:
+      context: .
+      dockerfile: Dockerfile.qa-all-filters-offline
+    env_file:
+      - .env
+    environment:
+      HF_HOME: /cache/huggingface
+      HUGGINGFACE_HUB_CACHE: /cache/huggingface/hub
+      TRANSFORMERS_CACHE: /cache/huggingface/transformers
+      VLLM_CACHE_ROOT: /cache/vllm
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ./:/app
+      - hf-cache:/cache/huggingface
+      - vllm-cache:/cache/vllm
+    working_dir: /app
+    entrypoint: ["python", "run_all_qa_filters_offline.py"]
+
 volumes:
   hf-cache:
     name: shared-hf-cache

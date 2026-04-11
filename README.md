@@ -162,6 +162,16 @@ The output row keeps the source record and adds `answer_relevance_reranker.raw_s
 Completed rows are skipped on resume here as well.
 The reranker service uses a dedicated GPU image with its own pinned Hugging Face stack, separate from the `vllm` image.
 
+You can also run the reranker on any custom JSONL file:
+
+```bash
+docker compose run --rm qa-reranker-offline --input-jsonl-path /app/data/custom.jsonl
+```
+
+In custom JSONL mode, the same field aliases are supported as for `qa-bad-answer-filter`.
+If a row contains multiple questions and multiple answers, the reranker evaluates the full Cartesian product and writes the result next to the input file as `<stem>.answer_relevance_reranker.jsonl`.
+Each output row contains `answer_relevance_reranker_pairs` with `pair_index`, `question`, `answer`, and `answer_relevance_reranker`.
+
 Rule-based bad-answer filtering on the same translated Polish files:
 
 ```bash
@@ -171,6 +181,56 @@ docker compose run --rm qa-rule-based-filter-offline --datasets nq_qa hotpotqa
 This reads `out_pl/<dataset>/translated.jsonl` and writes `out_pl/<dataset>/bad_answer_filter_rules.jsonl`.
 The output row keeps the source record and adds a `bad_answer_filter_rules` object with `is_good`, `reasons`, and `reasons_str`.
 Completed rows are skipped on resume here as well.
+
+You can also run the rule-based filter on any custom JSONL file:
+
+```bash
+docker compose run --rm qa-rule-based-filter-offline --input-jsonl-path /app/data/custom.jsonl
+```
+
+In custom JSONL mode, the same field aliases are supported as for `qa-bad-answer-filter`.
+If a row contains multiple questions and multiple answers, the rule-based filter evaluates the full Cartesian product and writes the result next to the input file as `<stem>.bad_answer_filter_rules.jsonl`.
+Each output row contains `bad_answer_filter_rules_pairs` with `pair_index`, `question`, `answer`, and `bad_answer_filter_rules`.
+
+Run all three offline QA filters in one command, in this order:
+1. `qa-rule-based-filter-offline`
+2. `qa-reranker-offline`
+3. `qa-bad-answer-filter-offline`
+4. final merge into one JSONL
+
+```bash
+docker compose run --rm qa-all-filters-offline --input-jsonl-path /app/custom_test.jsonl
+```
+
+The combined service accepts the same custom JSONL path argument and writes one final merged file next to the input:
+- `<stem>-filters.jsonl`
+
+After a successful merge, the three intermediate output files are removed.
+
+Smoke test with the included sample file:
+
+```bash
+docker compose run --rm qa-all-filters-offline --input-jsonl-path /app/custom_test.jsonl
+```
+
+The sample file is stored at [`custom_test.jsonl`](/c:/work/translate-context-relevance-datasets/custom_test.jsonl).
+After the run finishes, verify that this file was created next to it:
+- `custom_test-filters.jsonl`
+
+For a quick content check, open:
+- [`custom_test-filters.jsonl`](/c:/work/translate-context-relevance-datasets/custom_test-filters.jsonl)
+
+Merge known QA outputs into one JSONL per dataset:
+
+```bash
+docker compose run --rm qa-merge-results --datasets nq_qa hotpotqa
+```
+
+This reads `translated.jsonl` as the base file and merges only known QA output files such as
+`answer_relevance.jsonl`, `answer_relevance_reranker.jsonl`, `bad_answer_filter.jsonl`,
+`bad_answer_filter_evaluations.jsonl`, `bad_answer_filter_rules.jsonl`, and the known
+`bad_answer_filter_evaluations.<stage>.jsonl` stage files.
+It ignores unrelated JSONL files like backups and writes `out_pl/<dataset>/qa_merged_outputs.jsonl`.
 
 Optional offline tuning flags:
 - `--offline-tensor-parallel-size`
