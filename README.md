@@ -5,6 +5,7 @@ This repository provides a tool for translating context-relevance Hugging Face d
 Supported datasets:
 - [`zilliz/natural_questions-context-relevance-with-think`](https://huggingface.co/datasets/zilliz/natural_questions-context-relevance-with-think) (`nq`) - A Natural Questions-based context-relevance dataset with queries and candidate passages.
 - [`sentence-transformers/natural-questions`](https://huggingface.co/datasets/sentence-transformers/natural-questions) (`nq_qa`) - A Natural Questions QA-style dataset used here for question-answer translation and answer relevance scoring.
+- [`sentence-transformers/gooaq`](https://huggingface.co/datasets/sentence-transformers/gooaq) (`gooaq`) - A GooAQ question-answer dataset translated here through the same pair-style question/answer pipeline as other QA datasets.
 - [`sentence-transformers/hotpotqa`](https://huggingface.co/datasets/sentence-transformers/hotpotqa) (`hotpotqa`) - A HotpotQA-derived triplet dataset for question-answer relevance and retrieval-style evaluation.
 - [`zilliz/msmarco-context-relevance-with-think`](https://huggingface.co/datasets/zilliz/msmarco-context-relevance-with-think) (`msmarco`) - An MS MARCO-based context-relevance dataset with queries, passages, and rationale-style annotations.
 - [`thesofakillers/jigsaw-toxic-comment-classification-challenge`](https://huggingface.co/datasets/thesofakillers/jigsaw-toxic-comment-classification-challenge) (`toxic`, opt-in only) - A toxic comment classification dataset translated with toxicity labels preserved.
@@ -46,10 +47,10 @@ Key variables in `.env`:
 - `VLLM_MAX_NUM_BATCHED_TOKENS` (optional) - passed to `--max-num-batched-tokens` only when set
 - `VLLM_ENFORCE_EAGER` (optional) - if set to `1`, enables `--enforce-eager`
 - `HF_TOKEN` (optional/required for gated datasets) - Hugging Face token used by `load_dataset`
-- `FEW_SHOT_EXAMPLES_PATH` (optional) - path to CSV with EN->PL few-shot examples for pair-style datasets (`nq_qa`, `hotpotqa`)
+- `FEW_SHOT_EXAMPLES_PATH` (optional) - path to CSV with EN->PL few-shot examples for pair-style datasets (`nq_qa`, `gooaq`, `hotpotqa`)
 - `FEW_SHOT_EXAMPLE_COUNT` (optional) - number of random few-shot examples prepended for each pair-style prompt (default: `3`)
 - `FEW_SHOT_SHARED_REQUESTS` (optional) - how many consecutive pair-style requests reuse the same sampled few-shot examples (default: `10`)
-- `PAIR_PROMPT_MODE` (optional) - prompt mode for pair-style datasets (`few-shot` by default, or `no-few-shot` to use the new zero-shot path for `nq_qa` and `hotpotqa`)
+- `PAIR_PROMPT_MODE` (optional) - prompt mode for pair-style datasets (`few-shot` by default, or `no-few-shot` to use the new zero-shot path for `nq_qa`, `gooaq`, and `hotpotqa`)
 
 Available profiles:
 
@@ -277,14 +278,16 @@ Optional offline tuning flags:
 
 By default, the translator runs both context-relevance datasets sequentially (`nq` then `msmarco`).
 The `toxic` and `wildguard` datasets are not included in `all` and run only when explicitly selected.
-The `nq_qa` and `hotpotqa` datasets are also opt-in and keep their own output folders to avoid collisions with existing names.
+The `nq_qa`, `gooaq`, and `hotpotqa` datasets are also opt-in and keep their own output folders to avoid collisions with existing names.
 Use `--datasets` to limit the run:
 
 ```bash
 docker compose run --rm translator --datasets nq
 docker compose run --rm translator --datasets nq_qa
+docker compose run --rm translator --datasets gooaq
 docker compose run --rm translator --datasets hotpotqa
 docker compose run --rm translator --datasets nq_qa --pair-prompt-mode no-few-shot
+docker compose run --rm translator --datasets gooaq --pair-prompt-mode no-few-shot
 docker compose run --rm translator --datasets hotpotqa --pair-prompt-mode no-few-shot
 docker compose run --rm translator --datasets msmarco
 docker compose run --rm translator --datasets toxic --split train
@@ -319,6 +322,7 @@ Output files are written inside the repository directory, in separate subfolders
 
 - `out_pl/nq/translated.jsonl`, `out_pl/nq/failed_rows.jsonl`, `out_pl/nq/checkpoints/*.json`
 - `out_pl/nq_qa/translated.jsonl`, `out_pl/nq_qa/failed_rows.jsonl`
+- `out_pl/gooaq/translated.jsonl`, `out_pl/gooaq/failed_rows.jsonl`
 - `out_pl/nq_qa/answer_relevance.jsonl`, `out_pl/nq_qa/answer_relevance_failed_rows.jsonl`
 - `out_pl/nq_qa/bad_answer_filter_evaluations.jsonl`, `out_pl/nq_qa/bad_answer_filter_evaluations_failed_rows.jsonl`
 - `out_pl/nq_qa/bad_answer_filter_rules.jsonl`, `out_pl/nq_qa/bad_answer_filter_rules_failed_rows.jsonl`
@@ -345,7 +349,7 @@ Runtime behavior:
 
 - the translator uses structured output (`response_format=json_schema` when supported, with fallback to `json_object`) to enforce translation shape
 - in offline vLLM mode, the translator also uses vLLM structured decoding (`structured_outputs`/`guided_decoding`) when available
-- for `nq_qa` and `hotpotqa`, prompts reuse one sampled few-shot set for every 10 consecutive requests by default, with 3 random EN->PL examples from [`prompt_examples/ms_marco_translation_examples.csv`](/c:/work/translate-context-relevance-datasets/prompt_examples/ms_marco_translation_examples.csv)
+- for `nq_qa`, `gooaq`, and `hotpotqa`, prompts reuse one sampled few-shot set for every 10 consecutive requests by default, with 3 random EN->PL examples from [`prompt_examples/ms_marco_translation_examples.csv`](/c:/work/translate-context-relevance-datasets/prompt_examples/ms_marco_translation_examples.csv)
 - for `hotpotqa`, only `anchor` and `positive` are translated; `negative` is copied through unchanged in English
 - `hotpotqa` is loaded with the default Hugging Face config `triplet`
 - row-level failures do not stop the whole run by default; they are logged to `<out-dir>/<dataset_key>/failed_rows.jsonl`

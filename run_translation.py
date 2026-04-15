@@ -58,6 +58,7 @@ from translation_core import (
 DATASET_PRESETS: dict[str, str] = {
     "nq": "zilliz/natural_questions-context-relevance-with-think",
     "nq_qa": "sentence-transformers/natural-questions",
+    "gooaq": "sentence-transformers/gooaq",
     "hotpotqa": "sentence-transformers/hotpotqa",
     "msmarco": "zilliz/msmarco-context-relevance-with-think",
     "toxic": "thesofakillers/jigsaw-toxic-comment-classification-challenge",
@@ -105,6 +106,7 @@ WILDGUARD_CONFIG_BY_SPLIT = {
 }
 
 HOTPOTQA_DEFAULT_CONFIG = "triplet"
+GOOAQ_DEFAULT_CONFIG = "pair"
 
 
 def format_seconds(seconds: float) -> str:
@@ -622,12 +624,12 @@ def get_nq_qa_question_en(row: dict[str, Any]) -> str:
         question_en = row.get("query")
     question_en = str(question_en or "").strip()
     if not question_en:
-        raise RuntimeError("nq_qa row is missing a non-empty question/query value")
+        raise RuntimeError("QA pair row is missing a non-empty question/query value")
     return question_en
 
 
 def pair_prompt_uses_few_shot(dataset_key: str, prompt_mode: str) -> bool:
-    return dataset_key in ("nq_qa", "hotpotqa") and prompt_mode == "few-shot"
+    return dataset_key in ("nq_qa", "gooaq", "hotpotqa") and prompt_mode == "few-shot"
 
 
 def build_shared_few_shot_examples_by_rid(
@@ -1355,7 +1357,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--few-shot-examples-path",
         default=os.getenv("FEW_SHOT_EXAMPLES_PATH", DEFAULT_FEW_SHOT_EXAMPLES_PATH),
-        help="CSV file with EN->PL few-shot examples used for pair-style datasets such as nq_qa and hotpotqa.",
+        help="CSV file with EN->PL few-shot examples used for pair-style datasets such as nq_qa, gooaq, and hotpotqa.",
     )
     p.add_argument(
         "--few-shot-example-count",
@@ -1373,7 +1375,7 @@ def parse_args() -> argparse.Namespace:
         "--pair-prompt-mode",
         default=os.getenv("PAIR_PROMPT_MODE", "few-shot"),
         choices=["few-shot", "no-few-shot"],
-        help="Prompt mode for pair-style datasets (`nq_qa`, `hotpotqa`). Default preserves the existing few-shot path.",
+        help="Prompt mode for pair-style datasets (`nq_qa`, `gooaq`, `hotpotqa`). Default preserves the existing few-shot path.",
     )
     p.add_argument(
         "--fail-fast",
@@ -1385,7 +1387,7 @@ def parse_args() -> argparse.Namespace:
         "--datasets",
         nargs="+",
         default=["all"],
-        choices=["all", "nq", "nq_qa", "hotpotqa", "msmarco", "toxic", "wildguard"],
+        choices=["all", "nq", "nq_qa", "gooaq", "hotpotqa", "msmarco", "toxic", "wildguard"],
         help="Dataset selection: pass one or more keys. 'all' expands to NQ+MS MARCO.",
     )
     p.add_argument("--split", default="train", choices=["train", "validation", "test"])
@@ -1468,7 +1470,7 @@ def validate_dataset_schema(ds: Any, dataset_label: str, dataset_key: str) -> No
     cols = set(getattr(ds, "column_names", []) or [])
     if dataset_key == "toxic":
         required = REQUIRED_TOXIC_COLUMNS
-    elif dataset_key == "nq_qa":
+    elif dataset_key in ("nq_qa", "gooaq"):
         required = REQUIRED_NQ_QA_PRIMARY_COLUMNS
         if "question" not in cols and "query" not in cols:
             raise RuntimeError(
@@ -1503,12 +1505,15 @@ def load_dataset_for_run(dataset_hf_id: str, dataset_key: str, split: str, hf_to
     if dataset_key == "hotpotqa":
         return load_dataset(dataset_hf_id, name=HOTPOTQA_DEFAULT_CONFIG, split=split, token=hf_token)
 
+    if dataset_key == "gooaq":
+        return load_dataset(dataset_hf_id, name=GOOAQ_DEFAULT_CONFIG, split=split, token=hf_token)
+
     return load_dataset(dataset_hf_id, split=split, token=hf_token)
 
 
 async def run_single_dataset_async(args: argparse.Namespace) -> int:
     args.base_url, args.api_key = resolve_api_connection(args)
-    use_checkpoints = args.dataset_key not in ("toxic", "wildguard", "nq_qa", "hotpotqa")
+    use_checkpoints = args.dataset_key not in ("toxic", "wildguard", "nq_qa", "gooaq", "hotpotqa")
 
     if use_checkpoints and args.checkpoint_dir is None:
         args.checkpoint_dir = os.path.join(args.out_dir, "checkpoints")
@@ -1638,7 +1643,7 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
     total_units = 0
     done_units_before = 0
     for ds_idx, row in candidates:
-        row_units = 1 if args.dataset_key in ("toxic", "wildguard", "nq_qa", "hotpotqa") else 1 + len(row["texts"])
+        row_units = 1 if args.dataset_key in ("toxic", "wildguard", "nq_qa", "gooaq", "hotpotqa") else 1 + len(row["texts"])
         total_units += row_units
 
         if use_checkpoints:
@@ -1717,7 +1722,7 @@ async def run_single_dataset_async(args: argparse.Namespace) -> int:
             async with sem:
                 if args.dataset_key == "toxic":
                     return await process_row_toxic(row, ds_idx, args, api_key_last6, client, mark_units_done)
-                if args.dataset_key == "nq_qa":
+                if args.dataset_key in ("nq_qa", "gooaq"):
                     return await process_row_nq_qa(row, ds_idx, args, api_key_last6, client, mark_units_done)
                 if args.dataset_key == "hotpotqa":
                     return await process_row_hotpotqa(row, ds_idx, args, api_key_last6, client, mark_units_done)
