@@ -451,6 +451,15 @@ def read_jsonl_by_id(path: str) -> dict[str, dict[str, Any]]:
     return out
 
 
+def write_jsonl_rows_atomic(path: str, rows: list[dict[str, Any]]) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
 def resolve_row_id(row: dict[str, Any], dataset_key: str, row_idx: int) -> str:
     rid = str(row.get("id") or "").strip()
     if rid:
@@ -831,6 +840,68 @@ def merge_custom_bad_answer_filter_results(
     return out_row
 
 
+def missing_bad_answer_filter_final_stages(
+    final_row: dict[str, Any] | None,
+    args: argparse.Namespace,
+) -> list[str]:
+    selected_stages = selected_bad_answer_filter_stages(args)
+    if final_row is None:
+        return [stage.output_key for stage in selected_stages]
+
+    if getattr(args, "input_jsonl_path", None):
+        pairs = final_row.get("bad_answer_filter_pairs")
+        if not isinstance(pairs, list) or not pairs:
+            return [stage.output_key for stage in selected_stages]
+
+        missing: list[str] = []
+        for stage in selected_stages:
+            for pair in pairs:
+                if not isinstance(pair, dict):
+                    missing.append(stage.output_key)
+                    break
+                pair_filter = pair.get("bad_answer_filter")
+                if not isinstance(pair_filter, dict) or pair_filter.get(stage.output_key) is None:
+                    missing.append(stage.output_key)
+                    break
+        return missing
+
+    aggregate = final_row.get("bad_answer_filter")
+    if not isinstance(aggregate, dict):
+        return [stage.output_key for stage in selected_stages]
+    return [stage.output_key for stage in selected_stages if aggregate.get(stage.output_key) is None]
+
+
+def write_bad_answer_filter_final_snapshot(
+    out_jsonl: str,
+    rows: list[dict[str, Any]],
+    dataset_key: str,
+    final_rows_by_id: dict[str, dict[str, Any]],
+) -> None:
+    snapshot_rows: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for row_idx, row in enumerate(rows):
+        rid = resolve_row_id(row, dataset_key, row_idx)
+        final_row = final_rows_by_id.get(rid)
+        if final_row is None:
+            continue
+        snapshot_rows.append(final_row)
+        seen_ids.add(rid)
+
+    orphan_rows = [
+        row
+        for rid, row in final_rows_by_id.items()
+        if rid not in seen_ids
+    ]
+    if orphan_rows:
+        logging.warning(
+            "Keeping %d final bad-answer rows whose ids are not present in the input JSONL.",
+            len(orphan_rows),
+        )
+        snapshot_rows.extend(orphan_rows)
+
+    write_jsonl_rows_atomic(out_jsonl, snapshot_rows)
+
+
 async def run_bad_answer_filter_stage_async(
     args: argparse.Namespace,
     client: Any,
@@ -994,17 +1065,27 @@ async def run_bad_answer_filter_dataset_async(args: argparse.Namespace) -> int:
         return 0
 
     end_idx = min(total, skip + int(args.max_rows)) if args.max_rows and args.max_rows > 0 else total
-    final_done_ids = load_done_ids_from_jsonl(out_jsonl)
+    final_rows_by_id = read_jsonl_by_id(out_jsonl)
     candidates: list[tuple[int, dict[str, Any]]] = []
     for row_idx in range(skip, end_idx):
         row = rows[row_idx]
         rid = resolve_row_id(row, args.dataset_key, row_idx)
-        if rid in final_done_ids:
+        final_row = final_rows_by_id.get(rid)
+        if final_row is not None and (
+            not args.retry_failed_rows
+            or not missing_bad_answer_filter_final_stages(final_row, args)
+        ):
             continue
         candidates.append((row_idx, row))
 
     if not candidates:
-        print("Nothing to score (all rows already done in selected window).")
+        if final_rows_by_id:
+            write_bad_answer_filter_final_snapshot(out_jsonl, rows, args.dataset_key, final_rows_by_id)
+            logging.info("Bad-answer final snapshot compacted with one row per id: %s", out_jsonl)
+        if args.retry_failed_rows:
+            print("Nothing to score (all rows already have complete bad-answer filter outputs in selected window).")
+        else:
+            print("Nothing to score (all rows already done in selected window).")
         return 0
 
     async with build_inference_client(args) as client:
@@ -1024,10 +1105,12 @@ async def run_bad_answer_filter_dataset_async(args: argparse.Namespace) -> int:
             if stage.output_key in row
         }
 
-    final_done_ids = load_done_ids_from_jsonl(out_jsonl)
+    final_rows_by_id = read_jsonl_by_id(out_jsonl)
     for row_idx, row in candidates:
         rid = resolve_row_id(row, args.dataset_key, row_idx)
-        if rid in final_done_ids:
+        existing_final_row = final_rows_by_id.get(rid)
+        existing_missing_stages = set(missing_bad_answer_filter_final_stages(existing_final_row, args))
+        if existing_final_row is not None and (not args.retry_failed_rows or not existing_missing_stages):
             continue
         merged_stage_outputs: dict[str, Any] = {}
         missing_stages: list[str] = []
@@ -1046,9 +1129,17 @@ async def run_bad_answer_filter_dataset_async(args: argparse.Namespace) -> int:
             out_row = merge_custom_bad_answer_filter_results(row=row, stage_outputs=merged_stage_outputs, args=args)
         else:
             out_row = merge_bad_answer_filter_results(row=row, stage_outputs=merged_stage_outputs, args=args)
-        append_jsonl(out_jsonl, out_row)
-        final_done_ids.add(rid)
+        if existing_final_row is not None and args.retry_failed_rows:
+            new_missing_stages = set(missing_bad_answer_filter_final_stages(out_row, args))
+            if not (existing_missing_stages - new_missing_stages):
+                logging.info(
+                    "Skipping final bad-answer retry merge for id=%s because no missing stages were filled.",
+                    rid,
+                )
+                continue
+        final_rows_by_id[rid] = out_row
 
+    write_bad_answer_filter_final_snapshot(out_jsonl, rows, args.dataset_key, final_rows_by_id)
     logging.info("Bad-answer evaluation merge finished. Output: %s", out_jsonl)
     return 0
 

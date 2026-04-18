@@ -1,5 +1,8 @@
 import argparse
+import shutil
 import sys
+from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -20,12 +23,15 @@ from run_answer_relevance_vllm import (
     extract_question_answer,
     merge_bad_answer_filter_results,
     merge_custom_bad_answer_filter_results,
+    missing_bad_answer_filter_final_stages,
     parse_args,
+    read_jsonl_rows,
     resolve_input_output_paths,
     selected_bad_answer_filter_stages,
     selected_dataset_keys,
     task_failed_jsonl_name,
     task_output_jsonl_name,
+    write_bad_answer_filter_final_snapshot,
 )
 
 
@@ -348,6 +354,71 @@ def test_merge_custom_bad_answer_filter_results_uses_none_for_missing_stage() ->
     assert len(out_row["bad_answer_filter_pairs"]) == 2
     assert out_row["bad_answer_filter_pairs"][0]["bad_answer_filter"]["question_answer_meaning_drift"] is None
     assert out_row["bad_answer_filter_pairs"][1]["bad_answer_filter"]["answer_semantic_coherence"] is None
+
+
+def test_missing_bad_answer_filter_final_stages_detects_null_stage_output() -> None:
+    args = argparse.Namespace(enable_entity_integrity=False, input_jsonl_path=None)
+    final_row = {
+        "bad_answer_filter": {
+            "question_language_naturalness": {"reason": "OK", "score": 5},
+            "answer_language_naturalness": {"reason": "OK", "score": 5},
+            "answer_semantic_coherence": None,
+            "question_answer_meaning_drift": {"reason": "OK", "shared_meaning_elements": [], "score": 4},
+        }
+    }
+
+    assert missing_bad_answer_filter_final_stages(final_row, args) == ["answer_semantic_coherence"]
+
+
+def test_missing_bad_answer_filter_final_stages_detects_custom_pair_null_stage_output() -> None:
+    args = argparse.Namespace(enable_entity_integrity=False, input_jsonl_path="custom.jsonl")
+    final_row = {
+        "bad_answer_filter_pairs": [
+            {
+                "pair_index": 0,
+                "bad_answer_filter": {
+                    "question_language_naturalness": {"reason": "OK", "score": 5},
+                    "answer_language_naturalness": {"reason": "OK", "score": 5},
+                    "answer_semantic_coherence": {"reason": "OK", "problem_fragments": [], "score": 5},
+                    "question_answer_meaning_drift": {"reason": "OK", "shared_meaning_elements": [], "score": 4},
+                },
+            },
+            {
+                "pair_index": 1,
+                "bad_answer_filter": {
+                    "question_language_naturalness": {"reason": "OK", "score": 5},
+                    "answer_language_naturalness": {"reason": "OK", "score": 5},
+                    "answer_semantic_coherence": {"reason": "OK", "problem_fragments": [], "score": 5},
+                    "question_answer_meaning_drift": None,
+                },
+            },
+        ]
+    }
+
+    assert missing_bad_answer_filter_final_stages(final_row, args) == ["question_answer_meaning_drift"]
+
+
+def test_write_bad_answer_filter_final_snapshot_deduplicates_by_input_order() -> None:
+    root = Path("out_pl") / f"snapshot_test_{uuid4().hex}"
+    out_path = root / "bad_answer_filter_evaluations.jsonl"
+    try:
+        rows = [
+            {"id": "hotpotqa_1", "anchor": "Q1", "positive": "A1"},
+            {"id": "hotpotqa_2", "anchor": "Q2", "positive": "A2"},
+        ]
+        final_rows_by_id = {
+            "hotpotqa_2": {"id": "hotpotqa_2", "bad_answer_filter": {"score": 2}},
+            "hotpotqa_1": {"id": "hotpotqa_1", "bad_answer_filter": {"score": 1}},
+        }
+
+        write_bad_answer_filter_final_snapshot(str(out_path), rows, "hotpotqa", final_rows_by_id)
+
+        snapshot_rows = read_jsonl_rows(str(out_path))
+        assert [row["id"] for row in snapshot_rows] == ["hotpotqa_1", "hotpotqa_2"]
+        assert snapshot_rows[0]["bad_answer_filter"]["score"] == 1
+        assert snapshot_rows[1]["bad_answer_filter"]["score"] == 2
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_custom_bad_answer_filter_output_paths_are_next_to_input_file() -> None:
