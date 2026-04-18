@@ -95,6 +95,13 @@ def test_parse_args_accepts_hotpotqa_dataset(monkeypatch) -> None:
     assert args.datasets == ["hotpotqa"]
 
 
+def test_parse_args_accepts_gooaq_dataset(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_NAME", "test-model")
+    monkeypatch.setattr(sys, "argv", ["prog", "--datasets", "gooaq"])
+    args = parse_args()
+    assert args.datasets == ["gooaq"]
+
+
 def test_parse_args_accepts_few_shot_shared_requests(monkeypatch) -> None:
     monkeypatch.setenv("MODEL_NAME", "test-model")
     monkeypatch.setattr(sys, "argv", ["prog", "--datasets", "nq_qa", "--few-shot-shared-requests", "10"])
@@ -114,6 +121,7 @@ def test_selected_dataset_keys_all_excludes_toxic() -> None:
     assert selected_dataset_keys(["toxic"]) == ["toxic"]
     assert selected_dataset_keys(["wildguard"]) == ["wildguard"]
     assert selected_dataset_keys(["nq_qa"]) == ["nq_qa"]
+    assert selected_dataset_keys(["gooaq"]) == ["gooaq"]
     assert selected_dataset_keys(["hotpotqa"]) == ["hotpotqa"]
 
 
@@ -211,6 +219,24 @@ def test_load_dataset_for_run_maps_hotpotqa_to_default_triplet_config(monkeypatc
     assert out == "ok"
     assert called["dataset_hf_id"] == "sentence-transformers/hotpotqa"
     assert called["kwargs"]["name"] == "triplet"
+    assert called["kwargs"]["split"] == "train"
+    assert called["kwargs"]["token"] == "hf_xxx"
+
+
+def test_load_dataset_for_run_maps_gooaq_to_plain_split(monkeypatch) -> None:
+    called = {}
+
+    def fake_load_dataset(dataset_hf_id, **kwargs):
+        called["dataset_hf_id"] = dataset_hf_id
+        called["kwargs"] = kwargs
+        return "ok"
+
+    monkeypatch.setattr("run_translation.load_dataset", fake_load_dataset)
+
+    out = load_dataset_for_run("sentence-transformers/gooaq", "gooaq", "train", "hf_xxx")
+    assert out == "ok"
+    assert called["dataset_hf_id"] == "sentence-transformers/gooaq"
+    assert called["kwargs"]["name"] == "pair"
     assert called["kwargs"]["split"] == "train"
     assert called["kwargs"]["token"] == "hf_xxx"
 
@@ -358,6 +384,26 @@ def test_nq_qa_output_row_accepts_query_alias_from_dataset() -> None:
     assert out["answer_en"] == "Amber urine is a dark yellow urine color."
 
 
+def test_gooaq_output_row_contains_translations_and_optional_originals() -> None:
+    row = {
+        "question": "is toprol xl the same as metoprolol?",
+        "answer": "Metoprolol succinate is also known by the brand name Toprol XL.",
+    }
+    state = {"id": "gooaq-1", "question_pl": "czy Toprol XL to to samo co metoprolol?", "answer_pl": "Metoprolol succynian jest tez znany pod nazwa handlowa Toprol XL.", "active_model": "m2", "active_key_last6": "123abc"}
+    args = argparse.Namespace(dataset_key="gooaq", dataset="sentence-transformers/gooaq", base_url=None, keep_original_columns=True)
+
+    out = build_out_row_from_state_nq_qa(state, row, ds_idx=21, args=args)
+
+    assert out["id"] == "gooaq-1"
+    assert out["question"] == "czy Toprol XL to to samo co metoprolol?"
+    assert out["answer"] == "Metoprolol succynian jest tez znany pod nazwa handlowa Toprol XL."
+    assert out["question_en"] == "is toprol xl the same as metoprolol?"
+    assert out["answer_en"] == "Metoprolol succinate is also known by the brand name Toprol XL."
+    assert out["translation_model"] == "m2"
+    assert out["translation_key_last6"] == "123abc"
+    assert out["dataset_index"] == 21
+
+
 def test_hotpotqa_output_row_translates_anchor_and_positive_only() -> None:
     row = {
         "anchor": "who wrote the iliad",
@@ -491,6 +537,7 @@ def test_build_hotpotqa_zero_shot_messages_uses_single_user_turn() -> None:
 
 def test_pair_prompt_uses_few_shot_only_for_pair_datasets_in_few_shot_mode() -> None:
     assert pair_prompt_uses_few_shot("nq_qa", "few-shot") is True
+    assert pair_prompt_uses_few_shot("gooaq", "few-shot") is True
     assert pair_prompt_uses_few_shot("hotpotqa", "few-shot") is True
     assert pair_prompt_uses_few_shot("nq_qa", "no-few-shot") is False
     assert pair_prompt_uses_few_shot("nq", "few-shot") is False

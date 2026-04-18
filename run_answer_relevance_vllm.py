@@ -775,27 +775,33 @@ async def score_custom_bad_answer_filter_stage_row(
 
 def merge_bad_answer_filter_results(
     row: dict[str, Any],
-    stage_outputs: dict[str, dict[str, Any]],
+    stage_outputs: dict[str, dict[str, Any] | None],
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     aggregate: dict[str, Any] = {}
     for stage in selected_bad_answer_filter_stages(args):
-        if stage.output_key not in stage_outputs:
-            raise RuntimeError(f"Missing stage output for {stage.output_key}")
-        aggregate[stage.output_key] = stage_outputs[stage.output_key]
+        aggregate[stage.output_key] = stage_outputs.get(stage.output_key)
     return build_output_row(row=row, label="", result_obj=aggregate, args=args)
 
 
 def merge_custom_bad_answer_filter_results(
     row: dict[str, Any],
-    stage_outputs: dict[str, list[dict[str, Any]]],
+    stage_outputs: dict[str, list[dict[str, Any]] | None],
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     pairs_by_index: dict[int, dict[str, Any]] = {}
+    for pair in build_custom_jsonl_pairs(row):
+        pairs_by_index[pair["pair_index"]] = {
+            "pair_index": pair["pair_index"],
+            "question": pair["question"],
+            "answer": pair["answer"],
+            "bad_answer_filter": {},
+        }
+
     for stage in selected_bad_answer_filter_stages(args):
         pair_outputs = stage_outputs.get(stage.output_key)
         if pair_outputs is None:
-            raise RuntimeError(f"Missing stage output for {stage.output_key}")
+            continue
         for pair_output in pair_outputs:
             pair_index = int(pair_output["pair_index"])
             pair_entry = pairs_by_index.setdefault(
@@ -813,7 +819,7 @@ def merge_custom_bad_answer_filter_results(
     for pair in ordered_pairs:
         for stage in selected_bad_answer_filter_stages(args):
             if stage.output_key not in pair["bad_answer_filter"]:
-                raise RuntimeError(f"Missing stage output for pair_index={pair['pair_index']} stage={stage.output_key}")
+                pair["bad_answer_filter"][stage.output_key] = None
 
     out_row = dict(row)
     out_row["bad_answer_filter_pairs"] = ordered_pairs
@@ -1023,17 +1029,19 @@ async def run_bad_answer_filter_dataset_async(args: argparse.Namespace) -> int:
         rid = resolve_row_id(row, args.dataset_key, row_idx)
         if rid in final_done_ids:
             continue
-        merged_stage_outputs: dict[str, dict[str, Any]] = {}
-        missing_stage = None
+        merged_stage_outputs: dict[str, Any] = {}
+        missing_stages: list[str] = []
         for stage in selected_stages:
             stage_output = stage_results.get(stage.output_key, {}).get(rid)
             if stage_output is None:
-                missing_stage = stage.output_key
-                break
+                missing_stages.append(stage.output_key)
             merged_stage_outputs[stage.output_key] = stage_output
-        if missing_stage is not None:
-            logging.warning("Skipping final merge for id=%s because stage %s is missing.", rid, missing_stage)
-            continue
+        if missing_stages:
+            logging.warning(
+                "Merging final row for id=%s with null outputs for missing stages: %s.",
+                rid,
+                ", ".join(missing_stages),
+            )
         if getattr(args, "input_jsonl_path", None):
             out_row = merge_custom_bad_answer_filter_results(row=row, stage_outputs=merged_stage_outputs, args=args)
         else:

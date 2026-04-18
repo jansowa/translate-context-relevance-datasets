@@ -18,6 +18,7 @@ from run_answer_relevance_vllm import (
     custom_bad_answer_filter_output_jsonl_name,
     extract_custom_jsonl_questions_answers,
     extract_question_answer,
+    merge_bad_answer_filter_results,
     merge_custom_bad_answer_filter_results,
     parse_args,
     resolve_input_output_paths,
@@ -290,6 +291,63 @@ def test_merge_custom_bad_answer_filter_results_builds_pair_list() -> None:
     assert out_row["bad_answer_filter_pairs"][0]["answer"] == "O1"
     assert "answer_entity_integrity" not in out_row["bad_answer_filter_pairs"][0]["bad_answer_filter"]
     assert out_row["bad_answer_filter_model"] == "model-x"
+
+
+def test_merge_bad_answer_filter_results_uses_none_for_missing_stage() -> None:
+    args = argparse.Namespace(
+        task="bad_answer_filter",
+        model="model-x",
+        inference_source="offline",
+        base_url=None,
+        _api_key_last6="OFFLINE",
+        enable_entity_integrity=False,
+    )
+    row = {
+        "id": "hotpotqa_1",
+        "anchor": "Ktory zawodnik gral dla East Bengal?",
+        "positive": "East Bengal",
+    }
+    stage_outputs = {
+        "question_language_naturalness": {"reason": "OK", "score": 5},
+        "answer_language_naturalness": {"reason": "OK", "score": 4},
+        "answer_semantic_coherence": {"reason": "OK", "problem_fragments": [], "score": 5},
+    }
+
+    out_row = merge_bad_answer_filter_results(row, stage_outputs, args)
+
+    assert out_row["bad_answer_filter"]["question_answer_meaning_drift"] is None
+    assert out_row["bad_answer_filter"]["answer_semantic_coherence"]["score"] == 5
+
+
+def test_merge_custom_bad_answer_filter_results_uses_none_for_missing_stage() -> None:
+    args = argparse.Namespace(
+        task="bad_answer_filter",
+        model="model-x",
+        inference_source="offline",
+        base_url=None,
+        _api_key_last6="OFFLINE",
+        enable_entity_integrity=False,
+    )
+    row = {"anchor": ["P1", "P2"], "response": ["O1"]}
+    stage_outputs = {
+        "question_language_naturalness": [
+            {"pair_index": 0, "question": "P1", "answer": "O1", "question_language_naturalness": {"reason": "OK", "score": 5}},
+            {"pair_index": 1, "question": "P2", "answer": "O1", "question_language_naturalness": {"reason": "OK", "score": 4}},
+        ],
+        "answer_language_naturalness": [
+            {"pair_index": 0, "question": "P1", "answer": "O1", "answer_language_naturalness": {"reason": "OK", "score": 6}},
+            {"pair_index": 1, "question": "P2", "answer": "O1", "answer_language_naturalness": {"reason": "OK", "score": 6}},
+        ],
+        "answer_semantic_coherence": [
+            {"pair_index": 0, "question": "P1", "answer": "O1", "answer_semantic_coherence": {"reason": "OK", "problem_fragments": [], "score": 5}},
+        ],
+    }
+
+    out_row = merge_custom_bad_answer_filter_results(row, stage_outputs, args)
+
+    assert len(out_row["bad_answer_filter_pairs"]) == 2
+    assert out_row["bad_answer_filter_pairs"][0]["bad_answer_filter"]["question_answer_meaning_drift"] is None
+    assert out_row["bad_answer_filter_pairs"][1]["bad_answer_filter"]["answer_semantic_coherence"] is None
 
 
 def test_custom_bad_answer_filter_output_paths_are_next_to_input_file() -> None:
