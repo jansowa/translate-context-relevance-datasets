@@ -690,6 +690,7 @@ async def llm_call_json_async(
                     model=model,
                     temperature=temperature,
                     messages=messages,
+                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
                 )
 
                 if schema_enabled and response_schema is not None:
